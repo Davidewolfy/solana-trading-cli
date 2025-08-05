@@ -1,0 +1,338 @@
+id: e2e-integration
+namespace: solana.testing
+
+description: |
+  End-to-End Integration Test Flow
+  Tests the complete pipeline: Stream -> Router -> Trade (dry-run)
+
+inputs:
+  - id: duration
+    type: DURATION
+    required: false
+    defaults: "PT5M"
+    description: "Test duration"
+    
+  - id: yellowstoneEndpoint
+    type: STRING
+    required: false
+    defaults: "{{ secret('YELLOWSTONE_ENDPOINT') }}"
+    description: "Yellowstone gRPC endpoint"
+    
+  - id: programs
+    type: ARRAY
+    required: false
+    defaults: ["675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"]
+    description: "Programs to monitor"
+    
+  - id: testTokenInput
+    type: STRING
+    required: false
+    defaults: "So11111111111111111111111111111111111111112"
+    description: "Test input token (WSOL)"
+    
+  - id: testTokenOutput
+    type: STRING
+    required: false
+    defaults: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+    description: "Test output token (USDC)"
+    
+  - id: dryRun
+    type: BOOLEAN
+    required: false
+    defaults: true
+    description: "Use dry run mode (recommended)"
+
+variables:
+  - id: projectRoot
+    value: "/app/solana-trading-cli"
+  - id: nodeVersion
+    value: "22.2.0"
+  - id: testId
+    value: "e2e_{{ random() }}"
+
+tasks:
+  - id: setup-environment
+    type: io.kestra.plugin.scripts.node.Script
+    description: "Setup test environment and validate configuration"
+    nodeVersion: "{{ vars.nodeVersion }}"
+    workingDirectory: "{{ vars.projectRoot }}"
+    script: |
+      console.log('🔧 Setting up E2E test environment...');
+      
+      const config = {
+        testId: '{{ vars.testId }}',
+        duration: '{{ inputs.duration }}',
+        yellowstoneEndpoint: '{{ inputs.yellowstoneEndpoint }}',
+        programs: {{ inputs.programs }},
+        testTokens: {
+          input: '{{ inputs.testTokenInput }}',
+          output: '{{ inputs.testTokenOutput }}'
+        },
+        dryRun: {{ inputs.dryRun }}
+      };
+      
+      console.log('Test configuration:', JSON.stringify(config, null, 2));
+      
+      // Validate configuration
+      if (!config.yellowstoneEndpoint || !config.yellowstoneEndpoint.includes(':')) {
+        throw new Error('Invalid Yellowstone endpoint');
+      }
+      
+      if (!Array.isArray(config.programs) || config.programs.length === 0) {
+        throw new Error('At least one program must be specified');
+      }
+      
+      if (!config.testTokens.input || !config.testTokens.output) {
+        throw new Error('Test tokens must be specified');
+      }
+      
+      // Check if executor exists
+      const fs = require('fs');
+      const executorPath = '{{ vars.projectRoot }}/exec-rs/target/release/exec-rs';
+      
+      if (!fs.existsSync(executorPath)) {
+        console.warn('⚠️ Rust executor not found, will use mock responses');
+      }
+      
+      console.log('✅ Environment setup completed');
+      
+      // Store config for next tasks
+      process.env.E2E_CONFIG = JSON.stringify(config);
+
+  - id: build-components
+    type: io.kestra.plugin.scripts.node.Script
+    description: "Build and verify all components"
+    nodeVersion: "{{ vars.nodeVersion }}"
+    workingDirectory: "{{ vars.projectRoot }}"
+    dependsOn: [setup-environment]
+    script: |
+      console.log('🔨 Building and verifying components...');
+      
+      // Install dependencies if needed
+      const { execSync } = require('child_process');
+      
+      try {
+        console.log('📦 Installing Node.js dependencies...');
+        execSync('npm ci', { stdio: 'inherit' });
+        
+        console.log('🦀 Building Rust executor...');
+        execSync('cd exec-rs && cargo build --release', { stdio: 'inherit' });
+        
+      } catch (error) {
+        console.warn('⚠️ Build failed, continuing with available components:', error.message);
+      }
+      
+      // Verify components can be imported
+      try {
+        const { createUnifiedRouter } = require('./src/router/unified-router');
+        const { createJupiterUnifiedAdapter } = require('./src/router/adapters/jupiter-unified');
+        const { createUnifiedStreamingService } = require('./src/grpc/unified-streaming');
+        
+        console.log('✅ All components imported successfully');
+        
+        // Test component creation
+        const router = createUnifiedRouter();
+        const adapter = createJupiterUnifiedAdapter();
+        const streaming = createUnifiedStreamingService();
+        
+        console.log('✅ All components created successfully');
+        
+      } catch (error) {
+        console.error('❌ Component verification failed:', error);
+        throw error;
+      }
+
+  - id: run-e2e-test
+    type: io.kestra.plugin.scripts.node.Script
+    description: "Execute end-to-end integration test"
+    nodeVersion: "{{ vars.nodeVersion }}"
+    workingDirectory: "{{ vars.projectRoot }}"
+    dependsOn: [build-components]
+    timeout: "{{ inputs.duration }}"
+    script: |
+      const { E2EIntegration } = require('./examples/e2e-integration');
+      
+      console.log('🚀 Starting E2E integration test...');
+      
+      const config = JSON.parse(process.env.E2E_CONFIG);
+      config.executorPath = '{{ vars.projectRoot }}/exec-rs/target/release/exec-rs';
+      
+      console.log('E2E Config:', JSON.stringify(config, null, 2));
+      
+      const integration = new E2EIntegration(config);
+      
+      // Test results
+      let testResults = {
+        started: false,
+        connected: false,
+        quotesReceived: 0,
+        tradesTriggered: 0,
+        tradesSuccessful: 0,
+        errors: [],
+        events: []
+      };
+      
+      // Event handlers
+      integration.on('started', () => {
+        console.log('✅ E2E integration started');
+        testResults.started = true;
+      });
+      
+      integration.on('streamConnected', () => {
+        console.log('📡 Stream connected');
+        testResults.connected = true;
+      });
+      
+      integration.on('newPoolProcessed', (event) => {
+        console.log(`🆕 New pool processed: ${event.poolAddress}`);
+        testResults.events.push({ type: 'newPool', data: event });
+      });
+      
+      integration.on('testTradeCompleted', ({ event, result }) => {
+        console.log(`💰 Test trade completed: ${result.signature || 'simulated'}`);
+        testResults.tradesSuccessful++;
+        testResults.events.push({ type: 'tradeCompleted', data: result });
+      });
+      
+      integration.on('testTradeFailed', ({ event, result }) => {
+        console.log(`❌ Test trade failed: ${result.error}`);
+        testResults.errors.push(result.error);
+        testResults.events.push({ type: 'tradeFailed', data: result });
+      });
+      
+      integration.on('error', (error) => {
+        console.error('🚨 Integration error:', error);
+        testResults.errors.push(error.message);
+      });
+      
+      // Router events
+      integration.router?.on('quoteReceived', (event) => {
+        testResults.quotesReceived++;
+      });
+      
+      integration.router?.on('tradeAttempt', (event) => {
+        testResults.tradesTriggered++;
+      });
+      
+      try {
+        // Run the integration test
+        const durationMs = {{ inputs.duration }} === 'PT5M' ? 300000 : 180000; // 5 min or 3 min
+        await integration.runForDuration(durationMs);
+        
+        // Get final stats
+        const finalStats = integration.getStats();
+        testResults.finalStats = finalStats;
+        
+        console.log('📊 E2E Test Results:');
+        console.log(JSON.stringify(testResults, null, 2));
+        
+        // Store results for analysis
+        process.env.E2E_RESULTS = JSON.stringify(testResults);
+        
+        console.log('✅ E2E integration test completed');
+        
+      } catch (error) {
+        console.error('❌ E2E test failed:', error);
+        testResults.errors.push(error.message);
+        process.env.E2E_RESULTS = JSON.stringify(testResults);
+        throw error;
+      }
+
+  - id: analyze-results
+    type: io.kestra.plugin.scripts.node.Script
+    description: "Analyze test results and generate report"
+    nodeVersion: "{{ vars.nodeVersion }}"
+    workingDirectory: "{{ vars.projectRoot }}"
+    dependsOn: [run-e2e-test]
+    script: |
+      const testResults = JSON.parse(process.env.E2E_RESULTS || '{}');
+      
+      console.log('📊 Analyzing E2E test results...');
+      
+      const analysis = {
+        testId: '{{ vars.testId }}',
+        timestamp: new Date().toISOString(),
+        executionId: '{{ execution.id }}',
+        config: JSON.parse(process.env.E2E_CONFIG),
+        results: testResults,
+        metrics: {
+          testDuration: '{{ execution.duration }}',
+          successRate: testResults.tradesSuccessful / Math.max(testResults.tradesTriggered, 1) * 100,
+          errorRate: testResults.errors.length / Math.max(testResults.events.length, 1) * 100,
+          eventsProcessed: testResults.events.length,
+          quotesReceived: testResults.quotesReceived
+        },
+        status: 'unknown',
+        issues: [],
+        recommendations: []
+      };
+      
+      // Determine overall status
+      if (!testResults.started) {
+        analysis.status = 'failed';
+        analysis.issues.push('Integration failed to start');
+      } else if (!testResults.connected) {
+        analysis.status = 'failed';
+        analysis.issues.push('Failed to connect to streaming service');
+      } else if (testResults.errors.length > 0) {
+        analysis.status = 'partial';
+        analysis.issues.push(`${testResults.errors.length} errors encountered`);
+      } else {
+        analysis.status = 'success';
+      }
+      
+      // Generate recommendations
+      if (analysis.metrics.errorRate > 10) {
+        analysis.recommendations.push('High error rate - investigate connectivity issues');
+      }
+      
+      if (analysis.metrics.quotesReceived === 0) {
+        analysis.recommendations.push('No quotes received - verify router configuration');
+      }
+      
+      if (testResults.events.length === 0) {
+        analysis.recommendations.push('No events processed - check streaming configuration');
+      }
+      
+      if (analysis.metrics.successRate < 80 && testResults.tradesTriggered > 0) {
+        analysis.recommendations.push('Low trade success rate - review execution logic');
+      }
+      
+      console.log('📋 E2E Test Analysis:');
+      console.log(JSON.stringify(analysis, null, 2));
+      
+      // Save analysis report
+      const fs = require('fs');
+      const reportPath = `/tmp/e2e-analysis-${analysis.testId}.json`;
+      fs.writeFileSync(reportPath, JSON.stringify(analysis, null, 2));
+      console.log(`💾 Analysis report saved to: ${reportPath}`);
+      
+      // Fail the flow if test failed
+      if (analysis.status === 'failed') {
+        throw new Error(`E2E test failed: ${analysis.issues.join(', ')}`);
+      }
+
+triggers:
+  - id: manual-e2e-test
+    type: io.kestra.core.models.triggers.types.Manual
+    description: "Manual E2E integration test"
+
+  - id: scheduled-e2e-test
+    type: io.kestra.core.models.triggers.types.Schedule
+    description: "Daily E2E integration test"
+    cron: "0 0 2 * * ?" # Daily at 2 AM
+    disabled: true
+    inputs:
+      duration: "PT10M"
+      dryRun: true
+
+  - id: webhook-e2e-test
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: "Webhook triggered E2E test"
+    key: "e2e-test-webhook"
+
+labels:
+  environment: "testing"
+  project: "solana-integration"
+  version: "1.0.0"
+  type: "e2e-test"

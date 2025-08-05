@@ -1,0 +1,284 @@
+id: solana-health-monitoring
+namespace: solana.monitoring
+
+description: |
+  Comprehensive health monitoring flow for Solana trading system
+  Monitors system components, performance metrics, and alerts on issues
+
+inputs:
+  - id: checkInterval
+    type: DURATION
+    required: false
+    defaults: "PT1M"
+    description: "Health check interval (default: 1 minute)"
+    
+  - id: alertThreshold
+    type: STRING
+    required: false
+    defaults: "degraded"
+    description: "Alert threshold: healthy, degraded, unhealthy"
+    
+  - id: webhookUrl
+    type: STRING
+    required: false
+    description: "Webhook URL for health alerts"
+    
+  - id: enableMetrics
+    type: BOOLEAN
+    required: false
+    defaults: true
+    description: "Enable performance metrics collection"
+
+variables:
+  - id: projectRoot
+    value: "/app/solana-trading-cli"
+  - id: nodeVersion
+    value: "22.2.0"
+
+tasks:
+  - id: system-health-check
+    type: io.kestra.plugin.scripts.node.Script
+    description: "Run comprehensive system health checks"
+    nodeVersion: "{{ vars.nodeVersion }}"
+    workingDirectory: "{{ vars.projectRoot }}"
+    script: |
+      const { healthChecker } = require('./src/observability/health-checker');
+      const { metricsCollector } = require('./src/observability/metrics-collector');
+      
+      console.log('🏥 Running system health checks...');
+      
+      // Run all health checks
+      const healthResults = await healthChecker.runAllChecks();
+      const systemHealth = healthChecker.getSystemHealth();
+      
+      console.log(`📊 System Health: ${systemHealth.overall.toUpperCase()}`);
+      console.log(`⏱️ Uptime: ${Math.round(systemHealth.uptime / 1000)}s`);
+      
+      // Log individual check results
+      Object.entries(systemHealth.checks).forEach(([name, result]) => {
+        const status = result.healthy ? '✅' : '❌';
+        console.log(`${status} ${name}: ${result.message} (${result.responseTime}ms)`);
+        
+        if (result.details) {
+          console.log(`   Details: ${JSON.stringify(result.details)}`);
+        }
+      });
+      
+      // Store results for next task
+      process.env.HEALTH_STATUS = systemHealth.overall;
+      process.env.HEALTH_RESULTS = JSON.stringify(systemHealth);
+
+  - id: performance-metrics
+    type: io.kestra.plugin.scripts.node.Script
+    description: "Collect and analyze performance metrics"
+    nodeVersion: "{{ vars.nodeVersion }}"
+    workingDirectory: "{{ vars.projectRoot }}"
+    dependsOn: [system-health-check]
+    condition: "{{ inputs.enableMetrics }}"
+    script: |
+      const { metricsCollector, tradingMetrics } = require('./src/observability/metrics-collector');
+      
+      console.log('📈 Collecting performance metrics...');
+      
+      // Get trading metrics
+      const trading = tradingMetrics.getTradingMetrics();
+      
+      if (trading.latency) {
+        console.log(`⚡ Trade Latency - P95: ${trading.latency.p95}ms, P99: ${trading.latency.p99}ms`);
+      }
+      
+      if (trading.slippage) {
+        console.log(`📊 Slippage - P95: ${trading.slippage.p95}%, P99: ${trading.slippage.p99}%`);
+      }
+      
+      console.log(`✅ Success Rate: ${trading.successRate.toFixed(2)}%`);
+      
+      // Router performance comparison
+      console.log('🔀 Router Performance:');
+      Object.entries(trading.routerPerformance).forEach(([router, stats]) => {
+        if (stats) {
+          console.log(`   ${router}: P95=${stats.p95}ms, Count=${stats.count}`);
+        }
+      });
+      
+      // System metrics
+      const memUsage = process.memoryUsage();
+      const cpuUsage = process.cpuUsage();
+      
+      metricsCollector.gauge('system_memory_heap_used', memUsage.heapUsed / 1024 / 1024); // MB
+      metricsCollector.gauge('system_memory_heap_total', memUsage.heapTotal / 1024 / 1024); // MB
+      
+      console.log(`💾 Memory: ${Math.round(memUsage.heapUsed / 1024 / 1024)}MB used`);
+      
+      // Store metrics summary
+      const metricsSummary = metricsCollector.getMetricsSummary();
+      process.env.METRICS_SUMMARY = JSON.stringify(metricsSummary);
+
+  - id: alert-evaluation
+    type: io.kestra.plugin.scripts.node.Script
+    description: "Evaluate health status and send alerts if needed"
+    nodeVersion: "{{ vars.nodeVersion }}"
+    workingDirectory: "{{ vars.projectRoot }}"
+    dependsOn: [system-health-check, performance-metrics]
+    script: |
+      const healthStatus = process.env.HEALTH_STATUS;
+      const alertThreshold = '{{ inputs.alertThreshold }}';
+      const webhookUrl = '{{ inputs.webhookUrl }}';
+      
+      console.log(`🚨 Evaluating alerts - Status: ${healthStatus}, Threshold: ${alertThreshold}`);
+      
+      const shouldAlert = (
+        (alertThreshold === 'healthy' && healthStatus !== 'healthy') ||
+        (alertThreshold === 'degraded' && ['degraded', 'unhealthy'].includes(healthStatus)) ||
+        (alertThreshold === 'unhealthy' && healthStatus === 'unhealthy')
+      );
+      
+      if (shouldAlert && webhookUrl) {
+        console.log('📢 Sending health alert...');
+        
+        const healthResults = JSON.parse(process.env.HEALTH_RESULTS || '{}');
+        const metricsSummary = JSON.parse(process.env.METRICS_SUMMARY || '{}');
+        
+        const alertPayload = {
+          timestamp: new Date().toISOString(),
+          status: healthStatus,
+          threshold: alertThreshold,
+          system: 'solana-trading-cli',
+          health: healthResults,
+          metrics: metricsSummary,
+          severity: healthStatus === 'unhealthy' ? 'critical' : 'warning'
+        };
+        
+        try {
+          const axios = require('axios');
+          await axios.post(webhookUrl, alertPayload, {
+            headers: { 'Content-Type': 'application/json' },
+            timeout: 10000
+          });
+          
+          console.log('✅ Alert sent successfully');
+        } catch (error) {
+          console.error('❌ Failed to send alert:', error.message);
+        }
+      } else if (shouldAlert) {
+        console.log('⚠️ Alert condition met but no webhook URL configured');
+      } else {
+        console.log('✅ No alerts needed - system healthy');
+      }
+
+  - id: cleanup-old-data
+    type: io.kestra.plugin.scripts.node.Script
+    description: "Clean up old metrics and log data"
+    nodeVersion: "{{ vars.nodeVersion }}"
+    workingDirectory: "{{ vars.projectRoot }}"
+    dependsOn: [alert-evaluation]
+    allowFailure: true
+    script: |
+      const { metricsCollector } = require('./src/observability/metrics-collector');
+      const fs = require('fs');
+      const path = require('path');
+      
+      console.log('🧹 Cleaning up old data...');
+      
+      // Clean up old log files (keep last 7 days)
+      const logsDir = path.join(process.cwd(), 'logs');
+      if (fs.existsSync(logsDir)) {
+        const files = fs.readdirSync(logsDir);
+        const cutoff = Date.now() - (7 * 24 * 60 * 60 * 1000); // 7 days
+        
+        files.forEach(file => {
+          const filePath = path.join(logsDir, file);
+          const stats = fs.statSync(filePath);
+          
+          if (stats.mtime.getTime() < cutoff) {
+            fs.unlinkSync(filePath);
+            console.log(`🗑️ Deleted old log file: ${file}`);
+          }
+        });
+      }
+      
+      console.log('✅ Cleanup completed');
+
+  - id: generate-health-report
+    type: io.kestra.plugin.scripts.node.Script
+    description: "Generate comprehensive health report"
+    nodeVersion: "{{ vars.nodeVersion }}"
+    workingDirectory: "{{ vars.projectRoot }}"
+    dependsOn: [cleanup-old-data]
+    script: |
+      const healthResults = JSON.parse(process.env.HEALTH_RESULTS || '{}');
+      const metricsSummary = JSON.parse(process.env.METRICS_SUMMARY || '{}');
+      
+      const report = {
+        timestamp: new Date().toISOString(),
+        executionId: '{{ execution.id }}',
+        flowId: '{{ flow.id }}',
+        health: {
+          overall: healthResults.overall,
+          uptime: healthResults.uptime,
+          checks: Object.keys(healthResults.checks || {}).length,
+          healthy: Object.values(healthResults.checks || {}).filter(c => c.healthy).length
+        },
+        metrics: {
+          totalMetrics: Object.keys(metricsSummary).length,
+          hasLatencyData: !!metricsSummary.trade_execution_duration,
+          hasSlippageData: !!metricsSummary.trade_slippage
+        },
+        summary: {
+          status: healthResults.overall,
+          criticalIssues: Object.values(healthResults.checks || {})
+            .filter(c => !c.healthy)
+            .map(c => c.message),
+          recommendations: []
+        }
+      };
+      
+      // Add recommendations based on health status
+      if (healthResults.overall === 'unhealthy') {
+        report.summary.recommendations.push('Immediate attention required - critical systems failing');
+      } else if (healthResults.overall === 'degraded') {
+        report.summary.recommendations.push('Monitor system closely - some components degraded');
+      }
+      
+      console.log('📋 Health Report Generated:');
+      console.log(JSON.stringify(report, null, 2));
+      
+      // Save report to file
+      const fs = require('fs');
+      const reportPath = `/tmp/health-report-${Date.now()}.json`;
+      fs.writeFileSync(reportPath, JSON.stringify(report, null, 2));
+      console.log(`💾 Report saved to: ${reportPath}`);
+
+triggers:
+  - id: scheduled-health-check
+    type: io.kestra.core.models.triggers.types.Schedule
+    description: "Regular health monitoring"
+    cron: "0 */5 * * * ?" # Every 5 minutes
+    inputs:
+      checkInterval: "PT5M"
+      alertThreshold: "degraded"
+      enableMetrics: true
+
+  - id: critical-health-check
+    type: io.kestra.core.models.triggers.types.Schedule
+    description: "Frequent critical health monitoring"
+    cron: "0 * * * * ?" # Every minute
+    inputs:
+      checkInterval: "PT1M"
+      alertThreshold: "unhealthy"
+      enableMetrics: false
+
+  - id: manual-health-check
+    type: io.kestra.core.models.triggers.types.Manual
+    description: "Manual health check trigger"
+
+  - id: webhook-health-check
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: "External health check trigger"
+    key: "health-check-webhook"
+
+labels:
+  environment: "production"
+  project: "solana-monitoring"
+  version: "1.0.0"
+  criticality: "high"

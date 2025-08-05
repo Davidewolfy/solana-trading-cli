@@ -1,0 +1,292 @@
+id: minimal-stream
+namespace: solana.streaming
+
+description: |
+  Minimal streaming flow for Yellowstone gRPC
+  Monitors DEX programs and emits events
+
+inputs:
+  - id: endpoint
+    type: STRING
+    required: false
+    defaults: "{{ secret('YELLOWSTONE_ENDPOINT') }}"
+    description: "Yellowstone gRPC endpoint"
+    
+  - id: programs
+    type: ARRAY
+    required: false
+    defaults: ["675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"]
+    description: "Program IDs to monitor (default: Raydium)"
+    
+  - id: duration
+    type: DURATION
+    required: false
+    defaults: "PT10M"
+    description: "Streaming duration"
+    
+  - id: pingInterval
+    type: DURATION
+    required: false
+    defaults: "PT30S"
+    description: "Ping interval to keep connection alive"
+    
+  - id: enableFiltering
+    type: BOOLEAN
+    required: false
+    defaults: true
+    description: "Enable event filtering"
+
+variables:
+  - id: projectRoot
+    value: "/app/solana-trading-cli"
+  - id: nodeVersion
+    value: "22.2.0"
+  - id: sessionId
+    value: "stream_{{ random() }}"
+
+tasks:
+  - id: validate-streaming-config
+    type: io.kestra.plugin.scripts.node.Script
+    description: "Validate streaming configuration"
+    nodeVersion: "{{ vars.nodeVersion }}"
+    workingDirectory: "{{ vars.projectRoot }}"
+    script: |
+      console.log('🔍 Validating streaming configuration...');
+      
+      const config = {
+        endpoint: '{{ inputs.endpoint }}',
+        programs: {{ inputs.programs }},
+        duration: '{{ inputs.duration }}',
+        pingInterval: '{{ inputs.pingInterval }}',
+        enableFiltering: {{ inputs.enableFiltering }}
+      };
+      
+      console.log('Config:', JSON.stringify(config, null, 2));
+      
+      // Validate endpoint
+      if (!config.endpoint || !config.endpoint.includes(':')) {
+        throw new Error('Invalid gRPC endpoint format');
+      }
+      
+      // Validate programs
+      if (!Array.isArray(config.programs) || config.programs.length === 0) {
+        throw new Error('At least one program ID must be specified');
+      }
+      
+      for (const program of config.programs) {
+        if (!program || program.length !== 44) {
+          throw new Error(`Invalid program ID: ${program}`);
+        }
+      }
+      
+      console.log('✅ Streaming configuration validated');
+
+  - id: start-streaming
+    type: io.kestra.plugin.scripts.node.Script
+    description: "Start Yellowstone gRPC streaming"
+    nodeVersion: "{{ vars.nodeVersion }}"
+    workingDirectory: "{{ vars.projectRoot }}"
+    dependsOn: [validate-streaming-config]
+    timeout: "{{ inputs.duration }}"
+    script: |
+      const { createUnifiedStreamingService } = require('./src/grpc/unified-streaming');
+      
+      console.log('🚀 Starting Yellowstone gRPC streaming...');
+      
+      const streamConfig = {
+        endpoint: '{{ inputs.endpoint }}',
+        programs: {{ inputs.programs }},
+        pingIntervalMs: 30000, // 30 seconds
+        reconnectIntervalMs: 5000,
+        maxReconnectAttempts: 5
+      };
+      
+      console.log('Stream config:', JSON.stringify(streamConfig, null, 2));
+      
+      const streamingService = createUnifiedStreamingService(streamConfig);
+      
+      // Event counters
+      let eventCounts = {
+        total: 0,
+        newPool: 0,
+        liquidityUpdate: 0,
+        dexTx: 0,
+        account: 0,
+        transaction: 0,
+        slot: 0,
+        error: 0
+      };
+      
+      // Event handlers
+      streamingService.on('connected', () => {
+        console.log('✅ Connected to Yellowstone gRPC');
+      });
+      
+      streamingService.on('disconnected', () => {
+        console.log('❌ Disconnected from Yellowstone gRPC');
+      });
+      
+      streamingService.on('error', (error) => {
+        console.error('🚨 Streaming error:', error);
+        eventCounts.error++;
+      });
+      
+      streamingService.on('newPool', (event) => {
+        console.log(`🆕 New pool detected: ${event.dex} - ${event.poolAddress}`);
+        eventCounts.newPool++;
+        eventCounts.total++;
+      });
+      
+      streamingService.on('liquidityUpdate', (event) => {
+        console.log(`💧 Liquidity update: ${event.dex} - ${event.poolAddress}`);
+        eventCounts.liquidityUpdate++;
+        eventCounts.total++;
+      });
+      
+      streamingService.on('dexTx', (event) => {
+        console.log(`💱 DEX transaction: ${event.dex} - ${event.data.signature}`);
+        eventCounts.dexTx++;
+        eventCounts.total++;
+      });
+      
+      streamingService.on('account', (event) => {
+        if ({{ inputs.enableFiltering }}) {
+          // Only log significant account updates
+          if (event.data.lamports > 1000000) { // > 0.001 SOL
+            console.log(`📊 Account update: ${event.data.pubkey} - ${event.data.lamports} lamports`);
+          }
+        }
+        eventCounts.account++;
+        eventCounts.total++;
+      });
+      
+      streamingService.on('transaction', (event) => {
+        if (!event.data.isVote) { // Skip vote transactions
+          console.log(`📝 Transaction: ${event.data.signature}`);
+        }
+        eventCounts.transaction++;
+        eventCounts.total++;
+      });
+      
+      streamingService.on('slot', (event) => {
+        // Log every 100th slot to avoid spam
+        if (event.data.slot % 100 === 0) {
+          console.log(`⏰ Slot update: ${event.data.slot}`);
+        }
+        eventCounts.slot++;
+        eventCounts.total++;
+      });
+      
+      // Progress reporting
+      const reportInterval = setInterval(() => {
+        console.log('📊 Event counts:', JSON.stringify(eventCounts, null, 2));
+        
+        const stats = streamingService.getStats();
+        console.log('📈 Streaming stats:', JSON.stringify(stats, null, 2));
+      }, 60000); // Every minute
+      
+      try {
+        // Start streaming
+        await streamingService.start();
+        
+        // Keep streaming for the specified duration
+        const durationMs = {{ inputs.duration }} === 'PT10M' ? 600000 : 300000; // 10 min or 5 min
+        console.log(`⏱️ Streaming for ${durationMs / 1000} seconds...`);
+        
+        await new Promise(resolve => setTimeout(resolve, durationMs));
+        
+        console.log('⏹️ Streaming duration completed');
+        
+      } catch (error) {
+        console.error('❌ Streaming failed:', error);
+        throw error;
+      } finally {
+        clearInterval(reportInterval);
+        await streamingService.stop();
+        
+        // Final report
+        console.log('📋 Final event counts:', JSON.stringify(eventCounts, null, 2));
+        process.env.EVENT_COUNTS = JSON.stringify(eventCounts);
+      }
+
+  - id: analyze-stream-data
+    type: io.kestra.plugin.scripts.node.Script
+    description: "Analyze streaming data and generate insights"
+    nodeVersion: "{{ vars.nodeVersion }}"
+    workingDirectory: "{{ vars.projectRoot }}"
+    dependsOn: [start-streaming]
+    script: |
+      const eventCounts = JSON.parse(process.env.EVENT_COUNTS || '{}');
+      
+      console.log('📊 Analyzing streaming data...');
+      
+      const analysis = {
+        sessionId: '{{ vars.sessionId }}',
+        timestamp: new Date().toISOString(),
+        executionId: '{{ execution.id }}',
+        config: {
+          endpoint: '{{ inputs.endpoint }}',
+          programs: {{ inputs.programs }},
+          duration: '{{ inputs.duration }}'
+        },
+        events: eventCounts,
+        insights: {
+          totalEvents: eventCounts.total || 0,
+          eventsPerMinute: Math.round((eventCounts.total || 0) / 10), // Assuming 10 min duration
+          newPoolsDetected: eventCounts.newPool || 0,
+          liquidityUpdates: eventCounts.liquidityUpdate || 0,
+          dexTransactions: eventCounts.dexTx || 0,
+          errorRate: eventCounts.error / Math.max(eventCounts.total, 1) * 100
+        },
+        recommendations: []
+      };
+      
+      // Generate recommendations
+      if (analysis.insights.errorRate > 5) {
+        analysis.recommendations.push('High error rate detected - check network connectivity');
+      }
+      
+      if (analysis.insights.newPoolsDetected === 0) {
+        analysis.recommendations.push('No new pools detected - consider monitoring more programs');
+      }
+      
+      if (analysis.insights.eventsPerMinute < 10) {
+        analysis.recommendations.push('Low event rate - verify program IDs and endpoint');
+      }
+      
+      console.log('📋 Streaming Analysis:');
+      console.log(JSON.stringify(analysis, null, 2));
+      
+      // Save analysis
+      const fs = require('fs');
+      const analysisPath = `/tmp/stream-analysis-${analysis.sessionId}.json`;
+      fs.writeFileSync(analysisPath, JSON.stringify(analysis, null, 2));
+      console.log(`💾 Analysis saved to: ${analysisPath}`);
+
+triggers:
+  - id: manual-stream
+    type: io.kestra.core.models.triggers.types.Manual
+    description: "Manual streaming session"
+
+  - id: scheduled-stream
+    type: io.kestra.core.models.triggers.types.Schedule
+    description: "Scheduled streaming sessions"
+    cron: "0 0 */6 * * ?" # Every 6 hours
+    disabled: true
+    inputs:
+      duration: "PT30M"
+      programs: [
+        "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
+        "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+      ]
+
+  - id: webhook-stream
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: "Webhook triggered streaming"
+    key: "stream-webhook"
+
+labels:
+  environment: "development"
+  project: "solana-streaming"
+  version: "1.0.0"
+  type: "minimal"

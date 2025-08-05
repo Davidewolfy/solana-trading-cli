@@ -1,0 +1,316 @@
+id: minimal-trade
+namespace: solana.trading
+
+description: |
+  Minimal trading flow using unified router
+  Supports Jupiter-only routing with basic execution modes
+
+inputs:
+  - id: inputMint
+    type: STRING
+    required: true
+    description: "Input token mint address"
+    
+  - id: outputMint
+    type: STRING
+    required: true
+    description: "Output token mint address"
+    
+  - id: amount
+    type: STRING
+    required: true
+    description: "Amount to trade (in token units)"
+    
+  - id: slippageBps
+    type: INT
+    required: false
+    defaults: 50
+    description: "Slippage tolerance in basis points"
+    
+  - id: executionMode
+    type: STRING
+    required: false
+    defaults: "simple"
+    allowedValues: ["simple", "jito", "bloxroute"]
+    description: "Execution mode for the trade"
+    
+  - id: dryRun
+    type: BOOLEAN
+    required: false
+    defaults: false
+    description: "Simulate trade without execution"
+    
+  - id: walletPath
+    type: STRING
+    required: false
+    defaults: "/secrets/wallet.json"
+    description: "Path to wallet file"
+    
+  - id: priorityFee
+    type: INT
+    required: false
+    description: "Priority fee in microlamports"
+    
+  - id: computeUnitLimit
+    type: INT
+    required: false
+    description: "Compute unit limit for transaction"
+
+variables:
+  projectRoot: "/app/solana-trading-cli"
+  nodeVersion: "22.2.0"
+  tradeId: "{{ random() }}"
+
+tasks:
+  - id: validate-inputs
+    type: io.kestra.plugin.scripts.node.Script
+    description: "Validate trade inputs"
+    nodeVersion: "{{ vars.nodeVersion }}"
+    workingDirectory: "{{ vars.projectRoot }}"
+    script: |
+      console.log('🔍 Validating trade inputs...');
+      
+      const inputs = {
+        inputMint: '{{ inputs.inputMint }}',
+        outputMint: '{{ inputs.outputMint }}',
+        amount: '{{ inputs.amount }}',
+        slippageBps: {{ inputs.slippageBps }},
+        executionMode: '{{ inputs.executionMode }}',
+        dryRun: {{ inputs.dryRun }}
+      };
+      
+      console.log('Inputs:', JSON.stringify(inputs, null, 2));
+      
+      // Basic validation
+      if (!inputs.inputMint || inputs.inputMint.length !== 44) {
+        throw new Error('Invalid input mint address');
+      }
+      
+      if (!inputs.outputMint || inputs.outputMint.length !== 44) {
+        throw new Error('Invalid output mint address');
+      }
+      
+      if (!inputs.amount || parseFloat(inputs.amount) <= 0) {
+        throw new Error('Invalid amount');
+      }
+      
+      if (inputs.slippageBps < 1 || inputs.slippageBps > 10000) {
+        throw new Error('Slippage must be between 1 and 10000 basis points');
+      }
+      
+      console.log('✅ Input validation passed');
+
+  - id: get-quotes
+    type: io.kestra.plugin.scripts.node.Script
+    description: "Get quotes from unified router with all DEX adapters"
+    nodeVersion: "{{ vars.nodeVersion }}"
+    workingDirectory: "{{ vars.projectRoot }}"
+    dependsOn: [validate-inputs]
+    timeout: "PT30S"
+    retry:
+      type: "constant"
+      interval: "PT5S"
+      maxAttempt: 3
+    script: |
+      const { createUnifiedRouter } = require('./src/router/unified-router');
+      const {
+        createJupiterUnifiedAdapter,
+        createRaydiumUnifiedAdapter,
+        createOrcaUnifiedAdapter,
+        createMeteoraUnifiedAdapter
+      } = require('./src/router');
+
+      console.log('📊 Getting quotes from unified router with all DEX adapters...');
+
+      // Create router with enhanced configuration
+      const router = createUnifiedRouter({
+        defaultDex: 'jupiter',
+        timeoutMs: 8000,
+        enableParallelQuotes: true,
+        scoringWeights: {
+          expectedOut: 0.35,
+          priceImpact: -0.2,
+          fees: -0.15,
+          latency: -0.1,
+          confidence: 0.1,
+          hops: -0.05,
+          computeUnits: -0.05,
+          liquidity: 0.1
+        }
+      });
+
+      // Register all adapters
+      const executorPath = '{{ vars.projectRoot }}/exec-rs/target/release/exec-rs';
+
+      router.registerAdapter(createJupiterUnifiedAdapter({ executorPath }));
+      router.registerAdapter(createRaydiumUnifiedAdapter({ executorPath }));
+      router.registerAdapter(createOrcaUnifiedAdapter({ executorPath }));
+      router.registerAdapter(createMeteoraUnifiedAdapter({ executorPath }));
+
+      // Get quotes with enhanced parameters
+      const quoteParams = {
+        inputMint: '{{ inputs.inputMint }}',
+        outputMint: '{{ inputs.outputMint }}',
+        amount: '{{ inputs.amount }}',
+        slippageBps: {{ inputs.slippageBps }}
+      };
+
+      try {
+        const { quotes, best } = await router.quoteAll(quoteParams);
+
+        console.log(`📈 Received ${quotes.length} quotes from ${router.adapters.size} DEX adapters`);
+
+        if (best) {
+          console.log(`🎯 Best quote: ${best.dex}`);
+          console.log(`   Expected output: ${best.expectedOut}`);
+          console.log(`   Price impact: ${best.priceImpact}%`);
+          console.log(`   Confidence: ${best.confidence}`);
+          console.log(`   Hops: ${best.hops}`);
+          console.log(`   Compute units: ${best.computeUnits}`);
+          console.log(`   Latency: ${best.latencyMs}ms`);
+        }
+
+        // Store results for next task
+        process.env.QUOTES_RESULT = JSON.stringify({ quotes, best });
+
+        // Store router stats
+        const routerStats = router.getStats();
+        process.env.ROUTER_STATS = JSON.stringify(routerStats);
+
+      } catch (error) {
+        console.error('❌ Failed to get quotes:', error);
+        throw error;
+      }
+
+  - id: execute-trade
+    type: io.kestra.plugin.scripts.node.Script
+    description: "Execute trade using unified router"
+    nodeVersion: "{{ vars.nodeVersion }}"
+    workingDirectory: "{{ vars.projectRoot }}"
+    dependsOn: [get-quotes]
+    script: |
+      const { createUnifiedRouter } = require('./src/router/unified-router');
+      const { createJupiterUnifiedAdapter } = require('./src/router/adapters/jupiter-unified');
+      
+      console.log('⚡ Executing trade...');
+      
+      // Create router
+      const router = createUnifiedRouter();
+      const jupiterAdapter = createJupiterUnifiedAdapter({
+        executorPath: '{{ vars.projectRoot }}/exec-rs/target/release/exec-rs'
+      });
+      router.registerAdapter(jupiterAdapter);
+      
+      // Prepare trade parameters
+      const tradeParams = {
+        inputMint: '{{ inputs.inputMint }}',
+        outputMint: '{{ inputs.outputMint }}',
+        amount: '{{ inputs.amount }}',
+        slippageBps: {{ inputs.slippageBps }},
+        mode: '{{ inputs.executionMode }}',
+        dryRun: {{ inputs.dryRun }},
+        wallet: '{{ inputs.walletPath }}',
+        idempotencyKey: 'trade_{{ vars.tradeId }}'
+      };
+      
+      // Add optional parameters
+      {% if inputs.priorityFee %}
+      tradeParams.priorityFee = {{ inputs.priorityFee }};
+      {% endif %}
+      
+      {% if inputs.computeUnitLimit %}
+      tradeParams.computeUnitLimit = {{ inputs.computeUnitLimit }};
+      {% endif %}
+      
+      try {
+        const result = await router.trade(tradeParams);
+        
+        if (result.success) {
+          console.log('✅ Trade executed successfully');
+          if (result.signature) {
+            console.log(`📝 Signature: ${result.signature}`);
+          }
+          if (result.receivedAmount) {
+            console.log(`💰 Received: ${result.receivedAmount}`);
+          }
+          if (result.simulated) {
+            console.log('🧪 Trade was simulated (dry run)');
+          }
+        } else {
+          console.error('❌ Trade failed:', result.error);
+          throw new Error(result.error);
+        }
+        
+        // Store result
+        process.env.TRADE_RESULT = JSON.stringify(result);
+        
+      } catch (error) {
+        console.error('❌ Trade execution failed:', error);
+        throw error;
+      }
+
+  - id: generate-report
+    type: io.kestra.plugin.scripts.node.Script
+    description: "Generate trade execution report"
+    nodeVersion: "{{ vars.nodeVersion }}"
+    workingDirectory: "{{ vars.projectRoot }}"
+    dependsOn: [execute-trade]
+    script: |
+      const quotesResult = JSON.parse(process.env.QUOTES_RESULT || '{}');
+      const tradeResult = JSON.parse(process.env.TRADE_RESULT || '{}');
+      
+      const report = {
+        tradeId: '{{ vars.tradeId }}',
+        timestamp: new Date().toISOString(),
+        executionId: '{{ execution.id }}',
+        flowId: '{{ flow.id }}',
+        inputs: {
+          inputMint: '{{ inputs.inputMint }}',
+          outputMint: '{{ inputs.outputMint }}',
+          amount: '{{ inputs.amount }}',
+          slippageBps: {{ inputs.slippageBps }},
+          executionMode: '{{ inputs.executionMode }}',
+          dryRun: {{ inputs.dryRun }}
+        },
+        quotes: {
+          total: quotesResult.quotes?.length || 0,
+          bestDex: quotesResult.best?.dex,
+          expectedOutput: quotesResult.best?.expectedOut,
+          priceImpact: quotesResult.best?.priceImpact
+        },
+        execution: {
+          success: tradeResult.success,
+          signature: tradeResult.signature,
+          receivedAmount: tradeResult.receivedAmount,
+          slot: tradeResult.slot,
+          error: tradeResult.error,
+          simulated: tradeResult.simulated,
+          dexUsed: tradeResult.dex
+        },
+        performance: {
+          totalDuration: '{{ execution.duration }}',
+          quotingTime: 'N/A', // Would need timing from tasks
+          executionTime: 'N/A'
+        }
+      };
+      
+      console.log('📋 Trade Execution Report:');
+      console.log(JSON.stringify(report, null, 2));
+      
+      // Save report
+      const fs = require('fs');
+      const reportPath = `/tmp/trade-report-${report.tradeId}.json`;
+      fs.writeFileSync(reportPath, JSON.stringify(report, null, 2));
+      console.log(`💾 Report saved to: ${reportPath}`);
+
+triggers:
+  - id: webhook-trade
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: "Webhook triggered trade"
+    key: "trade-webhook"
+
+labels:
+  environment: "development"
+  project: "solana-trading"
+  version: "1.0.0"
+  type: "minimal"

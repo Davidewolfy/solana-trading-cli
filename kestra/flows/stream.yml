@@ -1,0 +1,303 @@
+id: solana-streaming-flow
+namespace: solana.streaming
+
+description: |
+  Real-time Solana market data streaming flow with gRPC integration
+  Monitors multiple DEXs for new pools, price updates, and trading opportunities
+
+inputs:
+  - id: dexes
+    type: ARRAY
+    required: false
+    defaults: ["raydium", "pump_fun"]
+    description: "DEXs to monitor: raydium, orca, meteora, pump_fun, cpmm"
+    
+  - id: tokenFilters
+    type: ARRAY
+    required: false
+    description: "Specific token addresses to monitor (empty = all tokens)"
+    
+  - id: minVolumeThreshold
+    type: FLOAT
+    required: false
+    defaults: 1000.0
+    description: "Minimum 24h volume threshold in USD"
+    
+  - id: minLiquidityThreshold
+    type: FLOAT
+    required: false
+    defaults: 5000.0
+    description: "Minimum liquidity threshold in USD"
+    
+  - id: grpcEndpoint
+    type: STRING
+    required: false
+    defaults: "grpc.triton.one:443"
+    description: "gRPC endpoint for streaming"
+    
+  - id: autoReconnect
+    type: BOOLEAN
+    required: false
+    defaults: true
+    description: "Enable automatic reconnection on connection loss"
+    
+  - id: reconnectInterval
+    type: INT
+    required: false
+    defaults: 5000
+    description: "Reconnection interval in milliseconds"
+    
+  - id: enableAlerts
+    type: BOOLEAN
+    required: false
+    defaults: true
+    description: "Enable alerts for significant events"
+    
+  - id: alertWebhook
+    type: STRING
+    required: false
+    description: "Webhook URL for sending alerts"
+
+variables:
+  - id: projectRoot
+    value: "/app/solana-trading-cli"
+  - id: nodeVersion
+    value: "22.2.0"
+  - id: streamingDuration
+    value: "PT1H" # 1 hour default
+
+tasks:
+  - id: setup-streaming
+    type: io.kestra.plugin.scripts.node.Script
+    description: "Initialize streaming service configuration"
+    nodeVersion: "{{ vars.nodeVersion }}"
+    workingDirectory: "{{ vars.projectRoot }}"
+    script: |
+      const { createStreamingService, StreamingDEX, DEFAULT_STREAMING_CONFIG } = require('./src/grpc');
+      
+      const inputs = {{ inputs }};
+      const { 
+        dexes, 
+        tokenFilters, 
+        minVolumeThreshold, 
+        minLiquidityThreshold,
+        grpcEndpoint,
+        autoReconnect,
+        reconnectInterval 
+      } = inputs;
+      
+      // Map string DEX names to enum values
+      const dexEnums = dexes.map(dex => {
+        const dexUpper = dex.toUpperCase();
+        if (StreamingDEX[dexUpper]) {
+          return StreamingDEX[dexUpper];
+        }
+        throw new Error(`Unsupported DEX: ${dex}`);
+      });
+      
+      const config = {
+        ...DEFAULT_STREAMING_CONFIG,
+        grpcEndpoint,
+        dexes: dexEnums,
+        tokenFilters: tokenFilters || [],
+        minVolumeThreshold,
+        minLiquidityThreshold,
+        autoReconnect,
+        reconnectInterval
+      };
+      
+      console.log('🔧 Streaming configuration:', JSON.stringify(config, null, 2));
+      
+      // Store config for next task
+      process.env.STREAMING_CONFIG = JSON.stringify(config);
+
+  - id: start-streaming
+    type: io.kestra.plugin.scripts.node.Script
+    description: "Start real-time market data streaming"
+    nodeVersion: "{{ vars.nodeVersion }}"
+    workingDirectory: "{{ vars.projectRoot }}"
+    dependsOn: [setup-streaming]
+    timeout: "{{ vars.streamingDuration }}"
+    script: |
+      const { createStreamingService } = require('./src/grpc');
+      const config = JSON.parse(process.env.STREAMING_CONFIG);
+      
+      const streamingService = createStreamingService(config);
+      
+      // Event counters
+      let eventCounts = {
+        newPools: 0,
+        priceUpdates: 0,
+        trades: 0,
+        errors: 0
+      };
+      
+      // Set up event listeners
+      streamingService.on('newPool', (data) => {
+        eventCounts.newPools++;
+        console.log(`🆕 New pool detected on ${data.dex}:`, {
+          token: data.tokenAddress,
+          pool: data.poolAddress,
+          timestamp: new Date(data.timestamp).toISOString()
+        });
+        
+        // Send alert if enabled
+        if ({{ inputs.enableAlerts }}) {
+          sendAlert('new_pool', data);
+        }
+      });
+      
+      streamingService.on('priceUpdate', (data) => {
+        eventCounts.priceUpdates++;
+        console.log(`📈 Price update on ${data.dex}:`, {
+          token: data.tokenAddress,
+          price: data.data.price,
+          change: data.data.priceChange24h,
+          timestamp: new Date(data.timestamp).toISOString()
+        });
+      });
+      
+      streamingService.on('trade', (data) => {
+        eventCounts.trades++;
+        console.log(`💱 Trade executed on ${data.dex}:`, {
+          token: data.tokenAddress,
+          side: data.data.side,
+          amount: data.data.amount,
+          price: data.data.price,
+          timestamp: new Date(data.timestamp).toISOString()
+        });
+        
+        // Send alert for large trades
+        if ({{ inputs.enableAlerts }} && data.data.amount > 10000) {
+          sendAlert('large_trade', data);
+        }
+      });
+      
+      streamingService.on('error', (error) => {
+        eventCounts.errors++;
+        console.error(`❌ Streaming error on ${error.dex}:`, error.error);
+      });
+      
+      // Alert function
+      async function sendAlert(type, data) {
+        const webhookUrl = '{{ inputs.alertWebhook }}';
+        if (!webhookUrl) return;
+        
+        try {
+          const axios = require('axios');
+          await axios.post(webhookUrl, {
+            type,
+            data,
+            timestamp: new Date().toISOString()
+          });
+        } catch (error) {
+          console.warn('Failed to send alert:', error.message);
+        }
+      }
+      
+      // Status reporting
+      const statusInterval = setInterval(() => {
+        const status = streamingService.getConnectionStatus();
+        console.log('📊 Streaming status:', {
+          connections: status,
+          events: eventCounts,
+          timestamp: new Date().toISOString()
+        });
+      }, 30000); // Every 30 seconds
+      
+      // Start streaming
+      console.log('🚀 Starting streaming service...');
+      await streamingService.start();
+      
+      // Keep running until timeout
+      await new Promise((resolve) => {
+        setTimeout(() => {
+          clearInterval(statusInterval);
+          resolve();
+        }, {{ vars.streamingDuration }} === 'PT1H' ? 3600000 : 300000); // 1 hour or 5 minutes
+      });
+      
+      // Stop streaming
+      console.log('🛑 Stopping streaming service...');
+      await streamingService.stop();
+      
+      console.log('📈 Final statistics:', eventCounts);
+
+  - id: process-market-data
+    type: io.kestra.plugin.scripts.node.Script
+    description: "Process and analyze collected market data"
+    nodeVersion: "{{ vars.nodeVersion }}"
+    workingDirectory: "{{ vars.projectRoot }}"
+    dependsOn: [start-streaming]
+    allowFailure: true
+    script: |
+      // This task would process the collected data
+      // For now, it's a placeholder for future analytics
+      
+      console.log('📊 Processing market data...');
+      
+      // Example: Analyze top performing tokens
+      // Example: Detect arbitrage opportunities
+      // Example: Generate trading signals
+      
+      console.log('✅ Market data processing completed');
+
+  - id: generate-report
+    type: io.kestra.plugin.scripts.node.Script
+    description: "Generate streaming session report"
+    nodeVersion: "{{ vars.nodeVersion }}"
+    workingDirectory: "{{ vars.projectRoot }}"
+    dependsOn: [process-market-data]
+    allowFailure: true
+    script: |
+      const report = {
+        sessionId: '{{ flow.id }}-{{ execution.id }}',
+        startTime: '{{ execution.startDate }}',
+        endTime: new Date().toISOString(),
+        configuration: {
+          dexes: {{ inputs.dexes }},
+          filters: {
+            tokens: {{ inputs.tokenFilters }},
+            minVolume: {{ inputs.minVolumeThreshold }},
+            minLiquidity: {{ inputs.minLiquidityThreshold }}
+          }
+        },
+        summary: {
+          duration: '{{ vars.streamingDuration }}',
+          status: 'completed'
+        }
+      };
+      
+      console.log('📋 Streaming session report:');
+      console.log(JSON.stringify(report, null, 2));
+      
+      // Store report (could be sent to database, file system, etc.)
+      const fs = require('fs');
+      const reportPath = `/tmp/streaming-report-${Date.now()}.json`;
+      fs.writeFileSync(reportPath, JSON.stringify(report, null, 2));
+      console.log(`💾 Report saved to: ${reportPath}`);
+
+triggers:
+  - id: manual-trigger
+    type: io.kestra.core.models.triggers.types.Manual
+    description: "Manual trigger for on-demand streaming"
+
+  - id: scheduled-streaming
+    type: io.kestra.core.models.triggers.types.Schedule
+    description: "Scheduled streaming sessions"
+    cron: "0 0 */4 * * ?" # Every 4 hours
+    disabled: true # Enable when needed
+    inputs:
+      dexes: ["raydium", "pump_fun", "orca"]
+      minVolumeThreshold: 5000
+      enableAlerts: true
+
+  - id: webhook-start-streaming
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: "Webhook trigger to start streaming on external signal"
+    key: "start-streaming-webhook"
+
+labels:
+  environment: "production"
+  project: "solana-streaming"
+  version: "1.0.0"

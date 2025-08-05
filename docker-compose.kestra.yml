@@ -1,0 +1,197 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15
+    container_name: kestra-postgres
+    environment:
+      POSTGRES_DB: kestra
+      POSTGRES_USER: kestra
+      POSTGRES_PASSWORD: kestra_password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kestra"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  kestra:
+    image: kestra/kestra:latest
+    container_name: kestra-server
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      KESTRA_CONFIGURATION: |
+        datasources:
+          postgres:
+            url: jdbc:postgresql://postgres:5432/kestra
+            driverClassName: org.postgresql.Driver
+            username: kestra
+            password: kestra_password
+        
+        kestra:
+          server:
+            basic-auth:
+              enabled: false
+          
+          repository:
+            type: postgres
+          
+          queue:
+            type: postgres
+          
+          storage:
+            type: local
+            local:
+              base-path: /app/storage
+          
+          secret:
+            type: secret-manager
+            secret-manager:
+              type: env
+              prefix: KESTRA_SECRET_
+          
+          plugins:
+            repositories:
+              central:
+                url: https://repo1.maven.org/maven2/
+              kestra:
+                url: https://dl.cloudsmith.io/public/kestra/kestra/maven/
+    
+    # Environment variables for secrets
+    environment:
+      # Infisical Configuration
+      INFISICAL_CLIENT_ID: "${INFISICAL_CLIENT_ID}"
+      INFISICAL_CLIENT_SECRET: "${INFISICAL_CLIENT_SECRET}"
+      INFISICAL_PROJECT_ID: "${INFISICAL_PROJECT_ID:-1232ea01-7ff9-4eac-be5a-c66a6cb34c88}"
+      INFISICAL_ENVIRONMENT: "${INFISICAL_ENVIRONMENT:-dev}"
+
+      # Solana RPC Configuration (fallback)
+      KESTRA_SECRET_RPC_URL: "${RPC_URL:-https://api.mainnet-beta.solana.com}"
+      KESTRA_SECRET_DEVNET_RPC_URL: "${DEVNET_RPC_URL:-https://api.devnet.solana.com}"
+      
+      # Yellowstone gRPC Configuration
+      KESTRA_SECRET_YELLOWSTONE_ENDPOINT: "${YELLOWSTONE_ENDPOINT:-grpc.triton.one:443}"
+      KESTRA_SECRET_YELLOWSTONE_TOKEN: "${YELLOWSTONE_TOKEN:-}"
+      
+      # Jupiter API Configuration
+      KESTRA_SECRET_JUPITER_API_URL: "${JUPITER_API_URL:-https://quote-api.jup.ag/v6}"
+      
+      # Wallet Configuration
+      KESTRA_SECRET_WALLET_PATH: "/secrets/wallet.json"
+      
+      # Execution Configuration
+      KESTRA_SECRET_EXECUTOR_PATH: "/app/exec-rs/target/release/exec-rs"
+      
+      # Monitoring and Alerting
+      KESTRA_SECRET_SLACK_WEBHOOK: "${SLACK_WEBHOOK:-}"
+      KESTRA_SECRET_DISCORD_WEBHOOK: "${DISCORD_WEBHOOK:-}"
+      
+      # Performance Tuning
+      KESTRA_SECRET_MAX_PARALLEL_QUOTES: "${MAX_PARALLEL_QUOTES:-4}"
+      KESTRA_SECRET_QUOTE_TIMEOUT_MS: "${QUOTE_TIMEOUT_MS:-10000}"
+      KESTRA_SECRET_TRADE_TIMEOUT_MS: "${TRADE_TIMEOUT_MS:-60000}"
+      
+      # Safety Limits
+      KESTRA_SECRET_MAX_TRADE_AMOUNT: "${MAX_TRADE_AMOUNT:-1000000000}"
+      KESTRA_SECRET_MAX_SLIPPAGE_BPS: "${MAX_SLIPPAGE_BPS:-1000}"
+      KESTRA_SECRET_REQUIRE_DRY_RUN: "${REQUIRE_DRY_RUN:-false}"
+    
+    volumes:
+      # Mount the project directory
+      - ./:/app/solana-trading-cli:ro
+      
+      # Mount flows directory
+      - ./kestra/flows:/app/flows:ro
+      
+      # Mount secrets directory
+      - ./secrets:/secrets:ro
+      
+      # Storage for Kestra data
+      - kestra_storage:/app/storage
+      
+      # Logs directory
+      - ./logs:/app/logs
+    
+    ports:
+      - "8080:8080"
+    
+    command: |
+      server standalone
+      --flow-path=/app/flows
+      --plugin-path=/app/plugins
+    
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+  # Optional: Redis for caching and session management
+  redis:
+    image: redis:7-alpine
+    container_name: kestra-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # Optional: Monitoring with Prometheus
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: kestra-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    profiles:
+      - monitoring
+
+  # Optional: Grafana for dashboards
+  grafana:
+    image: grafana/grafana:latest
+    container_name: kestra-grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources:ro
+    profiles:
+      - monitoring
+
+volumes:
+  postgres_data:
+    driver: local
+  kestra_storage:
+    driver: local
+  redis_data:
+    driver: local
+  prometheus_data:
+    driver: local
+  grafana_data:
+    driver: local
+
+networks:
+  default:
+    name: kestra-network

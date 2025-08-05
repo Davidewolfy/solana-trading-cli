@@ -1,0 +1,383 @@
+id: solana-paper-trading
+namespace: solana.trading
+
+description: |
+  Paper trading flow for testing strategies without real money
+  Simulates trades and tracks performance metrics
+
+inputs:
+  - id: strategy
+    type: STRING
+    required: true
+    description: "Trading strategy to test"
+    
+  - id: initialBalance
+    type: FLOAT
+    required: false
+    defaults: 10000.0
+    description: "Initial paper trading balance in USD"
+    
+  - id: maxPositionSize
+    type: FLOAT
+    required: false
+    defaults: 1000.0
+    description: "Maximum position size in USD"
+    
+  - id: tokens
+    type: ARRAY
+    required: false
+    defaults: ["7GCihgDB8fe6KNjn2MYtkzZcRjQy3t9GHdC8uHYmW2hr"]
+    description: "Token addresses to trade"
+    
+  - id: duration
+    type: DURATION
+    required: false
+    defaults: "PT1H"
+    description: "Paper trading session duration"
+    
+  - id: reportingInterval
+    type: DURATION
+    required: false
+    defaults: "PT5M"
+    description: "Performance reporting interval"
+
+variables:
+  - id: projectRoot
+    value: "/app/solana-trading-cli"
+  - id: nodeVersion
+    value: "22.2.0"
+
+tasks:
+  - id: initialize-paper-trading
+    type: io.kestra.plugin.scripts.node.Script
+    description: "Initialize paper trading session"
+    nodeVersion: "{{ vars.nodeVersion }}"
+    workingDirectory: "{{ vars.projectRoot }}"
+    script: |
+      const sessionId = `paper_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      const startTime = Date.now();
+      
+      const session = {
+        id: sessionId,
+        strategy: '{{ inputs.strategy }}',
+        startTime,
+        initialBalance: {{ inputs.initialBalance }},
+        currentBalance: {{ inputs.initialBalance }},
+        maxPositionSize: {{ inputs.maxPositionSize }},
+        tokens: {{ inputs.tokens }},
+        positions: {},
+        trades: [],
+        metrics: {
+          totalTrades: 0,
+          successfulTrades: 0,
+          totalPnL: 0,
+          maxDrawdown: 0,
+          sharpeRatio: 0
+        }
+      };
+      
+      console.log(`📊 Initialized paper trading session: ${sessionId}`);
+      console.log(`💰 Initial balance: $${session.initialBalance}`);
+      console.log(`🎯 Strategy: ${session.strategy}`);
+      console.log(`🪙 Tokens: ${session.tokens.join(', ')}`);
+      
+      // Store session data
+      process.env.PAPER_SESSION = JSON.stringify(session);
+
+  - id: run-paper-trading
+    type: io.kestra.plugin.scripts.node.Script
+    description: "Execute paper trading strategy"
+    nodeVersion: "{{ vars.nodeVersion }}"
+    workingDirectory: "{{ vars.projectRoot }}"
+    dependsOn: [initialize-paper-trading]
+    timeout: "{{ inputs.duration }}"
+    script: |
+      const { createDataAggregator } = require('./src/data/sources');
+      const { createRouter, DEXType, TradeSide } = require('./src/router');
+      const { createJupiterAdapter } = require('./src/router/adapters');
+      
+      let session = JSON.parse(process.env.PAPER_SESSION);
+      const strategy = session.strategy;
+      const reportingInterval = {{ inputs.reportingInterval }};
+      
+      console.log(`🚀 Starting paper trading with ${strategy} strategy`);
+      
+      // Initialize data sources and router for price data
+      const dataAggregator = createDataAggregator();
+      const router = createRouter({
+        wallet: null, // Not needed for paper trading
+        defaultDEX: DEXType.JUPITER,
+        autoSelectBestDEX: false
+      });
+      router.registerAdapter(createJupiterAdapter());
+      
+      // Paper trading simulation
+      const startTime = Date.now();
+      const endTime = startTime + ({{ inputs.duration }} === 'PT1H' ? 3600000 : 300000); // 1 hour or 5 minutes
+      
+      let lastReportTime = startTime;
+      let tradeCount = 0;
+      
+      while (Date.now() < endTime) {
+        try {
+          // Simulate strategy logic
+          for (const tokenAddress of session.tokens) {
+            const shouldTrade = await simulateStrategy(strategy, tokenAddress, session);
+            
+            if (shouldTrade.action !== 'hold') {
+              const trade = await executePaperTrade(
+                tokenAddress,
+                shouldTrade.action,
+                shouldTrade.amount,
+                session,
+                router
+              );
+              
+              if (trade) {
+                session.trades.push(trade);
+                session.metrics.totalTrades++;
+                tradeCount++;
+                
+                if (trade.pnl > 0) {
+                  session.metrics.successfulTrades++;
+                }
+                
+                session.metrics.totalPnL += trade.pnl;
+                session.currentBalance += trade.pnl;
+                
+                console.log(`📈 Paper Trade #${tradeCount}: ${trade.side} ${trade.amount} ${tokenAddress.substr(0, 8)}... PnL: $${trade.pnl.toFixed(2)}`);
+              }
+            }
+          }
+          
+          // Report progress periodically
+          if (Date.now() - lastReportTime >= (reportingInterval === 'PT5M' ? 300000 : 60000)) {
+            reportProgress(session);
+            lastReportTime = Date.now();
+          }
+          
+          // Wait before next iteration
+          await new Promise(resolve => setTimeout(resolve, 10000)); // 10 seconds
+          
+        } catch (error) {
+          console.error('Paper trading error:', error);
+          await new Promise(resolve => setTimeout(resolve, 5000)); // 5 second delay on error
+        }
+      }
+      
+      // Final session update
+      session.endTime = Date.now();
+      session.duration = session.endTime - session.startTime;
+      
+      console.log(`🏁 Paper trading session completed`);
+      console.log(`📊 Final balance: $${session.currentBalance.toFixed(2)}`);
+      console.log(`📈 Total PnL: $${session.metrics.totalPnL.toFixed(2)}`);
+      console.log(`🎯 Success rate: ${((session.metrics.successfulTrades / session.metrics.totalTrades) * 100).toFixed(1)}%`);
+      
+      process.env.PAPER_SESSION_FINAL = JSON.stringify(session);
+      
+      // Helper functions
+      async function simulateStrategy(strategy, tokenAddress, session) {
+        // Simple momentum strategy simulation
+        if (strategy === 'momentum') {
+          const random = Math.random();
+          if (random > 0.7) {
+            return { action: 'buy', amount: Math.min(100, session.maxPositionSize) };
+          } else if (random < 0.3 && session.positions[tokenAddress]) {
+            return { action: 'sell', amount: session.positions[tokenAddress] };
+          }
+        }
+        
+        // Mean reversion strategy simulation
+        if (strategy === 'mean_reversion') {
+          const random = Math.random();
+          if (random > 0.8) {
+            return { action: 'sell', amount: Math.min(100, session.maxPositionSize) };
+          } else if (random < 0.2) {
+            return { action: 'buy', amount: Math.min(100, session.maxPositionSize) };
+          }
+        }
+        
+        return { action: 'hold' };
+      }
+      
+      async function executePaperTrade(tokenAddress, side, amount, session, router) {
+        try {
+          // Get current price for simulation
+          const quote = await router.getAllQuotes({
+            tokenAddress,
+            side: side === 'buy' ? TradeSide.BUY : TradeSide.SELL,
+            amount
+          });
+          
+          if (quote.length === 0) {
+            return null;
+          }
+          
+          const bestQuote = quote[0];
+          const price = bestQuote.outputAmount / bestQuote.inputAmount;
+          
+          // Simulate slippage and fees
+          const slippage = (Math.random() * 2) + 0.5; // 0.5-2.5%
+          const fees = amount * 0.003; // 0.3% fees
+          const effectivePrice = price * (1 + (side === 'buy' ? slippage : -slippage) / 100);
+          
+          // Calculate PnL (simplified)
+          const currentPosition = session.positions[tokenAddress] || 0;
+          let pnl = 0;
+          
+          if (side === 'buy') {
+            session.positions[tokenAddress] = currentPosition + amount;
+            pnl = -fees; // Only fees for buy
+          } else {
+            const sellAmount = Math.min(amount, currentPosition);
+            session.positions[tokenAddress] = currentPosition - sellAmount;
+            // Simulate profit/loss
+            pnl = (Math.random() - 0.5) * amount * 0.1 - fees; // Random PnL ±5%
+          }
+          
+          return {
+            timestamp: Date.now(),
+            tokenAddress,
+            side,
+            amount,
+            price: effectivePrice,
+            slippage,
+            fees,
+            pnl
+          };
+          
+        } catch (error) {
+          console.error('Paper trade execution error:', error);
+          return null;
+        }
+      }
+      
+      function reportProgress(session) {
+        const runtime = (Date.now() - session.startTime) / 1000;
+        const pnlPercent = ((session.currentBalance - session.initialBalance) / session.initialBalance) * 100;
+        
+        console.log(`📊 Progress Report (${Math.round(runtime)}s):`);
+        console.log(`   Balance: $${session.currentBalance.toFixed(2)} (${pnlPercent.toFixed(2)}%)`);
+        console.log(`   Trades: ${session.metrics.totalTrades} (${session.metrics.successfulTrades} successful)`);
+        console.log(`   Positions: ${Object.keys(session.positions).length} active`);
+      }
+
+  - id: analyze-performance
+    type: io.kestra.plugin.scripts.node.Script
+    description: "Analyze paper trading performance"
+    nodeVersion: "{{ vars.nodeVersion }}"
+    workingDirectory: "{{ vars.projectRoot }}"
+    dependsOn: [run-paper-trading]
+    script: |
+      const session = JSON.parse(process.env.PAPER_SESSION_FINAL);
+      
+      console.log('📊 Analyzing paper trading performance...');
+      
+      // Calculate detailed metrics
+      const totalReturn = session.currentBalance - session.initialBalance;
+      const returnPercent = (totalReturn / session.initialBalance) * 100;
+      const durationHours = session.duration / (1000 * 60 * 60);
+      
+      // Calculate Sharpe ratio (simplified)
+      const trades = session.trades;
+      const returns = trades.map(t => t.pnl / session.initialBalance);
+      const avgReturn = returns.reduce((sum, r) => sum + r, 0) / returns.length || 0;
+      const returnStdDev = Math.sqrt(
+        returns.reduce((sum, r) => sum + Math.pow(r - avgReturn, 2), 0) / returns.length || 1
+      );
+      const sharpeRatio = returnStdDev > 0 ? avgReturn / returnStdDev : 0;
+      
+      // Calculate max drawdown
+      let peak = session.initialBalance;
+      let maxDrawdown = 0;
+      let runningBalance = session.initialBalance;
+      
+      trades.forEach(trade => {
+        runningBalance += trade.pnl;
+        if (runningBalance > peak) {
+          peak = runningBalance;
+        }
+        const drawdown = (peak - runningBalance) / peak * 100;
+        if (drawdown > maxDrawdown) {
+          maxDrawdown = drawdown;
+        }
+      });
+      
+      // Win rate
+      const winRate = session.metrics.totalTrades > 0 
+        ? (session.metrics.successfulTrades / session.metrics.totalTrades) * 100 
+        : 0;
+      
+      // Average trade size
+      const avgTradeSize = trades.length > 0 
+        ? trades.reduce((sum, t) => sum + t.amount, 0) / trades.length 
+        : 0;
+      
+      const analysis = {
+        session: {
+          id: session.id,
+          strategy: session.strategy,
+          duration: durationHours,
+          startTime: new Date(session.startTime).toISOString(),
+          endTime: new Date(session.endTime).toISOString()
+        },
+        performance: {
+          initialBalance: session.initialBalance,
+          finalBalance: session.currentBalance,
+          totalReturn,
+          returnPercent,
+          sharpeRatio,
+          maxDrawdown,
+          winRate,
+          avgTradeSize
+        },
+        trading: {
+          totalTrades: session.metrics.totalTrades,
+          successfulTrades: session.metrics.successfulTrades,
+          avgTradesPerHour: session.metrics.totalTrades / durationHours,
+          totalVolume: trades.reduce((sum, t) => sum + t.amount, 0)
+        },
+        risk: {
+          maxDrawdownPercent: maxDrawdown,
+          largestLoss: Math.min(...trades.map(t => t.pnl), 0),
+          largestWin: Math.max(...trades.map(t => t.pnl), 0),
+          volatility: returnStdDev * 100
+        }
+      };
+      
+      console.log('📈 Performance Analysis:');
+      console.log(`   Strategy: ${analysis.session.strategy}`);
+      console.log(`   Duration: ${analysis.session.duration.toFixed(2)} hours`);
+      console.log(`   Return: ${analysis.performance.returnPercent.toFixed(2)}%`);
+      console.log(`   Sharpe Ratio: ${analysis.performance.sharpeRatio.toFixed(3)}`);
+      console.log(`   Max Drawdown: ${analysis.risk.maxDrawdownPercent.toFixed(2)}%`);
+      console.log(`   Win Rate: ${analysis.performance.winRate.toFixed(1)}%`);
+      console.log(`   Total Trades: ${analysis.trading.totalTrades}`);
+      
+      // Save analysis
+      const fs = require('fs');
+      const analysisPath = `/tmp/paper-trading-analysis-${session.id}.json`;
+      fs.writeFileSync(analysisPath, JSON.stringify(analysis, null, 2));
+      console.log(`💾 Analysis saved to: ${analysisPath}`);
+
+triggers:
+  - id: manual-paper-trading
+    type: io.kestra.core.models.triggers.types.Manual
+    description: "Manual paper trading session"
+
+  - id: scheduled-paper-trading
+    type: io.kestra.core.models.triggers.types.Schedule
+    description: "Daily paper trading sessions"
+    cron: "0 0 9 * * ?" # Daily at 9 AM
+    disabled: true
+    inputs:
+      strategy: "momentum"
+      duration: "PT6H"
+      initialBalance: 10000
+
+labels:
+  environment: "testing"
+  project: "solana-trading"
+  version: "1.0.0"
+  type: "simulation"

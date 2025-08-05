@@ -1,0 +1,287 @@
+id: solana-trading-flow
+namespace: solana.trading
+
+description: |
+  Unified Solana trading flow supporting multiple DEXs (Jupiter, Raydium, Orca, Meteora)
+  with configurable execution methods and risk management
+
+inputs:
+  - id: tokenAddress
+    type: STRING
+    required: true
+    description: "Token address to trade"
+    
+  - id: side
+    type: STRING
+    required: true
+    defaults: "buy"
+    description: "Trade side: buy or sell"
+    
+  - id: dex
+    type: STRING
+    required: false
+    defaults: "jupiter"
+    description: "DEX to use: jupiter, raydium, orca, meteora, or auto for best price"
+    
+  - id: solAmount
+    type: FLOAT
+    required: false
+    description: "Amount of SOL for buy operations"
+    
+  - id: sellPercentage
+    type: FLOAT
+    required: false
+    description: "Percentage to sell (0-100) for sell operations"
+    
+  - id: tokenAmount
+    type: FLOAT
+    required: false
+    description: "Specific token amount to sell (alternative to sellPercentage)"
+    
+  - id: slippage
+    type: FLOAT
+    required: false
+    defaults: 1.0
+    description: "Slippage tolerance in percentage"
+    
+  - id: executionMethod
+    type: STRING
+    required: false
+    defaults: "simple"
+    description: "Execution method: simple, jito, bloxroute"
+    
+  - id: autoSelectBestDEX
+    type: BOOLEAN
+    required: false
+    defaults: false
+    description: "Automatically select DEX with best price"
+    
+  - id: maxSlippage
+    type: FLOAT
+    required: false
+    defaults: 5.0
+    description: "Maximum allowed slippage for auto-selection"
+    
+  - id: dryRun
+    type: BOOLEAN
+    required: false
+    defaults: false
+    description: "Perform dry run without executing trade"
+
+variables:
+  - id: projectRoot
+    value: "/app/solana-trading-cli"
+  - id: nodeVersion
+    value: "22.2.0"
+
+tasks:
+  - id: validate-inputs
+    type: io.kestra.plugin.scripts.node.Script
+    description: "Validate trading parameters"
+    nodeVersion: "{{ vars.nodeVersion }}"
+    workingDirectory: "{{ vars.projectRoot }}"
+    script: |
+      const { tokenAddress, side, solAmount, sellPercentage, tokenAmount } = {{ inputs }};
+      
+      // Validate token address
+      if (!tokenAddress || tokenAddress.length < 32) {
+        throw new Error('Invalid token address');
+      }
+      
+      // Validate side
+      if (!['buy', 'sell'].includes(side)) {
+        throw new Error('Side must be "buy" or "sell"');
+      }
+      
+      // Validate buy parameters
+      if (side === 'buy' && !solAmount) {
+        throw new Error('solAmount is required for buy operations');
+      }
+      
+      // Validate sell parameters
+      if (side === 'sell' && !sellPercentage && !tokenAmount) {
+        throw new Error('Either sellPercentage or tokenAmount is required for sell operations');
+      }
+      
+      console.log('✅ Input validation passed');
+
+  - id: get-quotes
+    type: io.kestra.plugin.scripts.node.Script
+    description: "Get price quotes from available DEXs"
+    nodeVersion: "{{ vars.nodeVersion }}"
+    workingDirectory: "{{ vars.projectRoot }}"
+    dependsOn: [validate-inputs]
+    script: |
+      const { createRouter, DEFAULT_ROUTER_CONFIG, DEXType } = require('./src/router');
+      const { createJupiterAdapter } = require('./src/router/adapters/jupiter');
+      const { createRaydiumAdapter } = require('./src/router/adapters/raydium');
+      const { createOrcaAdapter } = require('./src/router/adapters/orca');
+      const { createMeteoraAdapter } = require('./src/router/adapters/meteora');
+      const { wallet } = require('./src/helpers/config');
+      
+      const { tokenAddress, side, solAmount, tokenAmount, sellPercentage, autoSelectBestDEX } = {{ inputs }};
+      
+      // Create router with adapters
+      const config = {
+        ...DEFAULT_ROUTER_CONFIG,
+        wallet,
+        autoSelectBestDEX
+      };
+      
+      const router = createRouter(config);
+      router.registerAdapter(createJupiterAdapter());
+      router.registerAdapter(createRaydiumAdapter());
+      router.registerAdapter(createOrcaAdapter());
+      router.registerAdapter(createMeteoraAdapter());
+      
+      // Get quotes if auto-selection is enabled
+      if (autoSelectBestDEX) {
+        const amount = side === 'buy' ? solAmount : (tokenAmount || 0);
+        const quotes = await router.getAllQuotes({
+          tokenAddress,
+          side,
+          amount
+        });
+        
+        console.log('📊 Available quotes:', JSON.stringify(quotes, null, 2));
+        
+        // Find best quote
+        const bestQuote = quotes.find(q => q.isValid);
+        if (bestQuote) {
+          console.log(`🎯 Best DEX: ${bestQuote.dex} with output: ${bestQuote.outputAmount}`);
+        }
+      }
+
+  - id: execute-trade
+    type: io.kestra.plugin.scripts.node.Script
+    description: "Execute the trade"
+    nodeVersion: "{{ vars.nodeVersion }}"
+    workingDirectory: "{{ vars.projectRoot }}"
+    dependsOn: [get-quotes]
+    script: |
+      const { createRouter, DEFAULT_ROUTER_CONFIG, DEXType, TradeSide } = require('./src/router');
+      const { createJupiterAdapter } = require('./src/router/adapters/jupiter');
+      const { createRaydiumAdapter } = require('./src/router/adapters/raydium');
+      const { createOrcaAdapter } = require('./src/router/adapters/orca');
+      const { createMeteoraAdapter } = require('./src/router/adapters/meteora');
+      const { wallet } = require('./src/helpers/config');
+      
+      const inputs = {{ inputs }};
+      const { 
+        tokenAddress, 
+        side, 
+        dex, 
+        solAmount, 
+        sellPercentage, 
+        tokenAmount, 
+        slippage, 
+        executionMethod, 
+        autoSelectBestDEX,
+        dryRun 
+      } = inputs;
+      
+      // Create router with adapters
+      const config = {
+        ...DEFAULT_ROUTER_CONFIG,
+        wallet,
+        defaultDEX: dex ? DEXType[dex.toUpperCase()] : DEXType.JUPITER,
+        defaultSlippage: slippage || 1,
+        autoSelectBestDEX: autoSelectBestDEX || false
+      };
+      
+      const router = createRouter(config);
+      router.registerAdapter(createJupiterAdapter());
+      router.registerAdapter(createRaydiumAdapter());
+      router.registerAdapter(createOrcaAdapter());
+      router.registerAdapter(createMeteoraAdapter());
+      
+      if (dryRun) {
+        console.log('🧪 DRY RUN MODE - No actual trade will be executed');
+        console.log('Trade parameters:', JSON.stringify(inputs, null, 2));
+        return;
+      }
+      
+      // Execute trade
+      const tradeParams = {
+        tokenAddress,
+        side: TradeSide[side.toUpperCase()],
+        solAmount,
+        sellPercentage,
+        tokenAmount,
+        slippage,
+        dex: dex ? DEXType[dex.toUpperCase()] : undefined,
+        executionMethod
+      };
+      
+      console.log('🚀 Executing trade with parameters:', JSON.stringify(tradeParams, null, 2));
+      
+      const result = await router.trade(tradeParams);
+      
+      if (result.success) {
+        console.log('✅ Trade executed successfully!');
+        console.log(`📝 Signature: ${result.signature}`);
+        console.log(`🏪 DEX used: ${result.dexUsed}`);
+        console.log(`⚡ Execution method: ${result.executionMethodUsed}`);
+        console.log(`📊 Slippage: ${result.slippageUsed}%`);
+      } else {
+        console.error('❌ Trade failed:', result.error);
+        throw new Error(`Trade execution failed: ${result.error}`);
+      }
+
+  - id: post-trade-analysis
+    type: io.kestra.plugin.scripts.node.Script
+    description: "Analyze trade results and update metrics"
+    nodeVersion: "{{ vars.nodeVersion }}"
+    workingDirectory: "{{ vars.projectRoot }}"
+    dependsOn: [execute-trade]
+    allowFailure: true
+    script: |
+      const { getSPLTokenBalance } = require('./src/helpers/check_balance');
+      const { connection, wallet } = require('./src/helpers/config');
+      const { PublicKey } = require('@solana/web3.js');
+      
+      const { tokenAddress, side } = {{ inputs }};
+      
+      try {
+        // Get updated balance
+        const balance = await getSPLTokenBalance(
+          connection, 
+          new PublicKey(tokenAddress), 
+          wallet.publicKey
+        );
+        
+        console.log(`💰 Updated token balance: ${balance}`);
+        
+        // Log trade completion
+        console.log('📈 Trade analysis completed');
+        console.log(`🕐 Timestamp: ${new Date().toISOString()}`);
+        
+      } catch (error) {
+        console.warn('⚠️ Post-trade analysis failed:', error.message);
+      }
+
+triggers:
+  - id: manual-trigger
+    type: io.kestra.core.models.triggers.types.Manual
+    description: "Manual trigger for on-demand trading"
+
+  - id: webhook-trigger
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: "Webhook trigger for external trading signals"
+    key: "solana-trade-webhook"
+
+  - id: scheduled-dca
+    type: io.kestra.core.models.triggers.types.Schedule
+    description: "Scheduled DCA (Dollar Cost Averaging) trades"
+    cron: "0 0 12 * * ?" # Daily at noon
+    disabled: true # Enable when needed
+    inputs:
+      side: "buy"
+      solAmount: 0.1
+      dex: "jupiter"
+      autoSelectBestDEX: true
+
+labels:
+  environment: "production"
+  project: "solana-trading"
+  version: "1.0.0"

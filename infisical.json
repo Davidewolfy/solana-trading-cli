@@ -1,0 +1,17 @@
+{
+  "workspaceId": "1232ea01-7ff9-4eac-be5a-c66a6cb34c88",
+  "environments": [
+    {
+      "name": "dev",
+      "slug": "dev"
+    },
+    {
+      "name": "staging", 
+      "slug": "staging"
+    },
+    {
+      "name": "prod",
+      "slug": "prod"
+    }
+  ]
+}

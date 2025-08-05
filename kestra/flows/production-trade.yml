@@ -1,0 +1,389 @@
+id: production-trade
+namespace: solana.trading
+
+description: |
+  Production trading flow using unified router with all DEX adapters
+  Supports Jupiter, Raydium, Orca, Meteora with advanced scoring and fallback
+
+inputs:
+  - id: inputMint
+    type: STRING
+    required: true
+    description: "Input token mint address"
+    
+  - id: outputMint
+    type: STRING
+    required: true
+    description: "Output token mint address"
+    
+  - id: amount
+    type: STRING
+    required: true
+    description: "Amount to trade (in token units)"
+    
+  - id: slippageBps
+    type: INT
+    required: false
+    defaults: 50
+    description: "Slippage tolerance in basis points"
+    
+  - id: executionMode
+    type: STRING
+    required: false
+    defaults: "simple"
+    allowedValues: ["simple", "jito", "bloxroute"]
+    description: "Execution mode for the trade"
+    
+  - id: dryRun
+    type: BOOLEAN
+    required: false
+    defaults: false
+    description: "Simulate trade without execution"
+    
+  - id: priorityFee
+    type: INT
+    required: false
+    description: "Priority fee in microlamports"
+    
+  - id: computeUnitLimit
+    type: INT
+    required: false
+    description: "Compute unit limit for transaction"
+    
+  - id: enableParallelQuotes
+    type: BOOLEAN
+    required: false
+    defaults: true
+    description: "Enable parallel quote fetching"
+
+variables:
+  projectRoot: "/app/solana-trading-cli"
+  nodeVersion: "22.2.0"
+  tradeId: "{{ random() }}"
+
+tasks:
+  - id: validate-inputs
+    type: io.kestra.plugin.scripts.node.Script
+    description: "Validate trade inputs and environment"
+    nodeVersion: "{{ vars.nodeVersion }}"
+    workingDirectory: "{{ vars.projectRoot }}"
+    timeout: "PT30S"
+    script: |
+      console.log('🔍 Validating production trade inputs...');
+      
+      const inputs = {
+        inputMint: '{{ inputs.inputMint }}',
+        outputMint: '{{ inputs.outputMint }}',
+        amount: '{{ inputs.amount }}',
+        slippageBps: {{ inputs.slippageBps }},
+        executionMode: '{{ inputs.executionMode }}',
+        dryRun: {{ inputs.dryRun }},
+        enableParallelQuotes: {{ inputs.enableParallelQuotes }}
+      };
+      
+      console.log('Inputs:', JSON.stringify(inputs, null, 2));
+      
+      // Enhanced validation
+      if (!inputs.inputMint || inputs.inputMint.length !== 44) {
+        throw new Error('Invalid input mint address');
+      }
+      
+      if (!inputs.outputMint || inputs.outputMint.length !== 44) {
+        throw new Error('Invalid output mint address');
+      }
+      
+      if (inputs.inputMint === inputs.outputMint) {
+        throw new Error('Input and output mints cannot be the same');
+      }
+      
+      if (!inputs.amount || parseFloat(inputs.amount) <= 0) {
+        throw new Error('Invalid amount');
+      }
+      
+      if (inputs.slippageBps < 1 || inputs.slippageBps > 10000) {
+        throw new Error('Slippage must be between 1 and 10000 basis points');
+      }
+      
+      // Check environment variables
+      const requiredEnvVars = ['RPC_URL'];
+      for (const envVar of requiredEnvVars) {
+        if (!process.env[envVar]) {
+          throw new Error(`Missing required environment variable: ${envVar}`);
+        }
+      }
+      
+      console.log('✅ Production input validation passed');
+
+  - id: health-check
+    type: io.kestra.plugin.scripts.node.Script
+    description: "Health check for all systems"
+    nodeVersion: "{{ vars.nodeVersion }}"
+    workingDirectory: "{{ vars.projectRoot }}"
+    dependsOn: [validate-inputs]
+    timeout: "PT60S"
+    script: |
+      console.log('🏥 Performing system health checks...');
+      
+      const { spawn } = require('child_process');
+      const { promisify } = require('util');
+      const execFile = promisify(require('child_process').execFile);
+      
+      // Check Rust executor
+      try {
+        console.log('Checking Rust executor...');
+        const { stdout } = await execFile('{{ vars.projectRoot }}/exec-rs/target/release/exec-rs', [
+          'ping', '--rpc-url', process.env.RPC_URL, '--timeout', '10'
+        ]);
+        
+        const result = JSON.parse(stdout);
+        if (!result.success) {
+          throw new Error(`Executor health check failed: ${result.error}`);
+        }
+        
+        console.log(`✅ Executor healthy - Current slot: ${result.slot}`);
+        
+      } catch (error) {
+        console.error('❌ Executor health check failed:', error);
+        throw error;
+      }
+      
+      console.log('✅ All systems healthy');
+
+  - id: get-multi-dex-quotes
+    type: io.kestra.plugin.scripts.node.Script
+    description: "Get quotes from all DEX adapters with advanced scoring"
+    nodeVersion: "{{ vars.nodeVersion }}"
+    workingDirectory: "{{ vars.projectRoot }}"
+    dependsOn: [health-check]
+    timeout: "PT45S"
+    retry:
+      type: "constant"
+      interval: "PT10S"
+      maxAttempt: 3
+    script: |
+      const { createUnifiedRouter } = require('./src/router/unified-router');
+      const { 
+        createJupiterUnifiedAdapter,
+        createRaydiumUnifiedAdapter,
+        createOrcaUnifiedAdapter,
+        createMeteoraUnifiedAdapter
+      } = require('./src/router');
+      
+      console.log('📊 Getting quotes from all DEX adapters...');
+      
+      // Create router with production configuration
+      const router = createUnifiedRouter({
+        defaultDex: 'jupiter',
+        timeoutMs: 12000,
+        enableParallelQuotes: {{ inputs.enableParallelQuotes }},
+        maxRetries: 2,
+        scoringWeights: {
+          expectedOut: 0.35,
+          priceImpact: -0.2,
+          fees: -0.15,
+          latency: -0.1,
+          confidence: 0.1,
+          hops: -0.05,
+          computeUnits: -0.05,
+          liquidity: 0.1
+        }
+      });
+      
+      // Register all available adapters
+      const executorPath = '{{ vars.projectRoot }}/exec-rs/target/release/exec-rs';
+      
+      try {
+        router.registerAdapter(createJupiterUnifiedAdapter({ executorPath }));
+        console.log('✅ Jupiter adapter registered');
+      } catch (error) {
+        console.warn('⚠️ Jupiter adapter failed to register:', error.message);
+      }
+      
+      try {
+        router.registerAdapter(createRaydiumUnifiedAdapter({ executorPath }));
+        console.log('✅ Raydium adapter registered');
+      } catch (error) {
+        console.warn('⚠️ Raydium adapter failed to register:', error.message);
+      }
+      
+      try {
+        router.registerAdapter(createOrcaUnifiedAdapter({ executorPath }));
+        console.log('✅ Orca adapter registered');
+      } catch (error) {
+        console.warn('⚠️ Orca adapter failed to register:', error.message);
+      }
+      
+      try {
+        router.registerAdapter(createMeteoraUnifiedAdapter({ executorPath }));
+        console.log('✅ Meteora adapter registered');
+      } catch (error) {
+        console.warn('⚠️ Meteora adapter failed to register:', error.message);
+      }
+      
+      console.log(`📡 Registered ${router.adapters?.size || 0} DEX adapters`);
+      
+      // Get quotes with enhanced parameters
+      const quoteParams = {
+        inputMint: '{{ inputs.inputMint }}',
+        outputMint: '{{ inputs.outputMint }}',
+        amount: '{{ inputs.amount }}',
+        slippageBps: {{ inputs.slippageBps }}
+      };
+      
+      try {
+        const startTime = Date.now();
+        const { quotes, best } = await router.quoteAll(quoteParams);
+        const quotingTime = Date.now() - startTime;
+        
+        console.log(`📈 Received ${quotes.length} quotes in ${quotingTime}ms`);
+        
+        if (best) {
+          console.log(`🎯 Best quote: ${best.dex}`);
+          console.log(`   Expected output: ${best.expectedOut}`);
+          console.log(`   Price impact: ${best.priceImpact}%`);
+          console.log(`   Confidence: ${best.confidence}`);
+          console.log(`   Hops: ${best.hops}`);
+          console.log(`   Compute units: ${best.computeUnits}`);
+          console.log(`   Latency: ${best.latencyMs}ms`);
+          console.log(`   Liquidity score: ${best.liquidityScore}`);
+        } else {
+          throw new Error('No valid quotes received from any DEX');
+        }
+        
+        // Store results for next task
+        process.env.QUOTES_RESULT = JSON.stringify({ 
+          quotes, 
+          best, 
+          quotingTime,
+          adaptersUsed: quotes.map(q => q.dex)
+        });
+        
+        // Store router stats
+        const routerStats = router.getStats();
+        process.env.ROUTER_STATS = JSON.stringify(routerStats);
+        
+        console.log('✅ Multi-DEX quoting completed successfully');
+        
+      } catch (error) {
+        console.error('❌ Failed to get quotes:', error);
+        throw error;
+      }
+
+  - id: execute-production-trade
+    type: io.kestra.plugin.scripts.node.Script
+    description: "Execute trade with production safeguards"
+    nodeVersion: "{{ vars.nodeVersion }}"
+    workingDirectory: "{{ vars.projectRoot }}"
+    dependsOn: [get-multi-dex-quotes]
+    timeout: "PT120S"
+    script: |
+      const { createUnifiedRouter } = require('./src/router/unified-router');
+      const { 
+        createJupiterUnifiedAdapter,
+        createRaydiumUnifiedAdapter,
+        createOrcaUnifiedAdapter,
+        createMeteoraUnifiedAdapter
+      } = require('./src/router');
+      
+      console.log('⚡ Executing production trade...');
+      
+      // Recreate router (in production, you'd reuse the instance)
+      const router = createUnifiedRouter({
+        defaultDex: 'jupiter',
+        maxRetries: 3
+      });
+      
+      const executorPath = '{{ vars.projectRoot }}/exec-rs/target/release/exec-rs';
+      
+      // Register adapters (simplified for execution)
+      router.registerAdapter(createJupiterUnifiedAdapter({ executorPath }));
+      
+      // Get quote results
+      const quotesResult = JSON.parse(process.env.QUOTES_RESULT || '{}');
+      
+      if (!quotesResult.best) {
+        throw new Error('No best quote available for execution');
+      }
+      
+      // Prepare trade parameters with production settings
+      const tradeParams = {
+        inputMint: '{{ inputs.inputMint }}',
+        outputMint: '{{ inputs.outputMint }}',
+        amount: '{{ inputs.amount }}',
+        slippageBps: {{ inputs.slippageBps }},
+        mode: '{{ inputs.executionMode }}',
+        dryRun: {{ inputs.dryRun }},
+        wallet: process.env.WALLET_PATH || '/secrets/wallet.json',
+        idempotencyKey: 'prod_trade_{{ vars.tradeId }}'
+      };
+      
+      // Add optional parameters
+      {% if inputs.priorityFee %}
+      tradeParams.priorityFee = {{ inputs.priorityFee }};
+      {% endif %}
+      
+      {% if inputs.computeUnitLimit %}
+      tradeParams.computeUnitLimit = {{ inputs.computeUnitLimit }};
+      {% endif %}
+      
+      try {
+        const startTime = Date.now();
+        const result = await router.trade(tradeParams);
+        const executionTime = Date.now() - startTime;
+        
+        if (result.success) {
+          console.log('✅ Production trade executed successfully');
+          if (result.signature) {
+            console.log(`📝 Signature: ${result.signature}`);
+          }
+          if (result.receivedAmount) {
+            console.log(`💰 Received: ${result.receivedAmount}`);
+          }
+          if (result.simulated) {
+            console.log('🧪 Trade was simulated (dry run)');
+          }
+          console.log(`⏱️ Execution time: ${executionTime}ms`);
+        } else {
+          console.error('❌ Production trade failed:', result.error);
+          throw new Error(result.error);
+        }
+        
+        // Store result with enhanced metadata
+        const enhancedResult = {
+          ...result,
+          executionTime,
+          quotingTime: quotesResult.quotingTime,
+          adaptersUsed: quotesResult.adaptersUsed,
+          bestQuote: quotesResult.best,
+          tradeParams: { ...tradeParams, wallet: '[REDACTED]' }
+        };
+        
+        process.env.TRADE_RESULT = JSON.stringify(enhancedResult);
+        
+      } catch (error) {
+        console.error('❌ Production trade execution failed:', error);
+        throw error;
+      }
+
+triggers:
+  - id: webhook-production-trade
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: "Webhook triggered production trade"
+    key: "production-trade-webhook"
+
+  - id: scheduled-health-check
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: "Scheduled health check"
+    cron: "0 */15 * * * ?" # Every 15 minutes
+    disabled: true
+    inputs:
+      inputMint: "So11111111111111111111111111111111111111112"
+      outputMint: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+      amount: "1000000"
+      dryRun: true
+
+labels:
+  environment: "production"
+  project: "solana-trading"
+  version: "2.0.0"
+  type: "multi-dex"

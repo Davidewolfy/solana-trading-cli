@@ -1,0 +1,390 @@
+id: strategy-shadow-mode
+namespace: solana.strategies
+
+description: |
+  Shadow mode strategy execution - logs trading decisions without actual execution
+  Monitors memcoin signals and tests launch-momentum and micro-breakout strategies
+
+inputs:
+  - id: duration
+    type: DURATION
+    required: false
+    defaults: "PT30M"
+    description: "Shadow mode duration"
+    
+  - id: strategies
+    type: ARRAY
+    required: false
+    defaults: ["launch_momentum", "micro_breakout"]
+    description: "Strategies to test in shadow mode"
+    
+  - id: programs
+    type: ARRAY
+    required: false
+    defaults: [
+      "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8",
+      "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+    ]
+    description: "Program IDs to monitor (Raydium, Pump.fun)"
+    
+  - id: riskLimits
+    type: JSON
+    required: false
+    defaults: {
+      "maxDailyNotional": 10000,
+      "maxDailyTrades": 50,
+      "maxDailyDrawdown": 1000,
+      "maxPerTokenExposure": 500,
+      "globalKillSwitch": false
+    }
+    description: "Risk limits for shadow mode testing"
+    
+  - id: signalFilters
+    type: JSON
+    required: false
+    defaults: {
+      "minTvl": 5000,
+      "minTxPerMin": 5,
+      "maxSpread": 200,
+      "minDepth": 1000
+    }
+    description: "Signal filtering parameters"
+
+variables:
+  projectRoot: "/app/solana-trading-cli"
+  nodeVersion: "22.2.0"
+  sessionId: "shadow_{{ random() }}"
+
+tasks:
+  - id: validate-shadow-config
+    type: io.kestra.plugin.scripts.node.Script
+    description: "Validate shadow mode configuration"
+    nodeVersion: "{{ vars.nodeVersion }}"
+    workingDirectory: "{{ vars.projectRoot }}"
+    timeout: "PT30S"
+    script: |
+      console.log('🔍 Validating shadow mode configuration...');
+      
+      const config = {
+        duration: '{{ inputs.duration }}',
+        strategies: {{ inputs.strategies }},
+        programs: {{ inputs.programs }},
+        riskLimits: {{ inputs.riskLimits }},
+        signalFilters: {{ inputs.signalFilters }}
+      };
+      
+      console.log('Shadow mode config:', JSON.stringify(config, null, 2));
+      
+      // Validate strategies
+      const validStrategies = ['launch_momentum', 'micro_breakout', 'mean_reversion', 'event_driven', 'dca'];
+      for (const strategy of config.strategies) {
+        if (!validStrategies.includes(strategy)) {
+          throw new Error(`Invalid strategy: ${strategy}`);
+        }
+      }
+      
+      // Validate risk limits
+      if (config.riskLimits.maxDailyNotional <= 0) {
+        throw new Error('maxDailyNotional must be positive');
+      }
+      
+      if (config.riskLimits.maxDailyTrades <= 0) {
+        throw new Error('maxDailyTrades must be positive');
+      }
+      
+      console.log('✅ Shadow mode configuration validated');
+
+  - id: initialize-strategy-manager
+    type: io.kestra.plugin.scripts.node.Script
+    description: "Initialize strategy manager in shadow mode"
+    nodeVersion: "{{ vars.nodeVersion }}"
+    workingDirectory: "{{ vars.projectRoot }}"
+    dependsOn: [validate-shadow-config]
+    timeout: "PT60S"
+    script: |
+      const { createStrategyManager } = require('./dist/strategies/strategy-manager');
+      
+      console.log('🎯 Initializing strategy manager in shadow mode...');
+      
+      const riskLimits = {{ inputs.riskLimits }};
+      const shadowMode = true;
+      
+      // Create strategy manager
+      const strategyManager = createStrategyManager(riskLimits, shadowMode);
+      
+      // Setup event listeners for logging
+      strategyManager.on('decisionGenerated', (event) => {
+        console.log('📊 Strategy Decision Generated:');
+        console.log(`   Strategy: ${event.strategy}`);
+        console.log(`   Action: ${event.decision.action}`);
+        console.log(`   Token: ${event.decision.signal.tokenMint}`);
+        console.log(`   Confidence: ${(event.decision.confidence * 100).toFixed(1)}%`);
+        console.log(`   Size: $${event.decision.sizing.finalAmount}`);
+        console.log(`   Reasoning: ${event.decision.reasoning.join('; ')}`);
+      });
+      
+      strategyManager.on('decisionBlocked', (event) => {
+        console.log('🚫 Decision Blocked:');
+        console.log(`   Strategy: ${event.strategy}`);
+        console.log(`   Reason: ${event.reason}`);
+        console.log(`   Token: ${event.decision.signal.tokenMint}`);
+      });
+      
+      strategyManager.on('shadowDecision', (event) => {
+        console.log('👻 Shadow Decision Logged:');
+        console.log(`   Token: ${event.decision.signal.tokenMint}`);
+        console.log(`   Action: ${event.decision.action}`);
+        console.log(`   Amount: $${event.decision.sizing.finalAmount}`);
+        console.log(`   Estimated Slippage: ${event.estimatedResult.simulatedSlippage}bps`);
+      });
+      
+      // Store manager instance for next task
+      global.strategyManager = strategyManager;
+      
+      console.log('✅ Strategy manager initialized in shadow mode');
+      console.log(`   Registered strategies: ${Array.from(strategyManager.strategies?.keys() || []).join(', ')}`);
+
+  - id: start-signal-monitoring
+    type: io.kestra.plugin.scripts.node.Script
+    description: "Start monitoring signals and generating trading decisions"
+    nodeVersion: "{{ vars.nodeVersion }}"
+    workingDirectory: "{{ vars.projectRoot }}"
+    dependsOn: [initialize-strategy-manager]
+    timeout: "{{ inputs.duration }}"
+    script: |
+      const { createUnifiedStreamingService } = require('./dist/grpc/unified-streaming');
+      
+      console.log('📡 Starting signal monitoring for shadow mode...');
+      
+      const strategyManager = global.strategyManager;
+      const signalFilters = {{ inputs.signalFilters }};
+      
+      // Create streaming service
+      const streamingService = createUnifiedStreamingService({
+        endpoint: process.env.YELLOWSTONE_ENDPOINT || 'grpc.triton.one:443',
+        programs: {{ inputs.programs }},
+        pingIntervalMs: 30000
+      });
+      
+      // Signal generation and processing
+      let signalCount = 0;
+      let decisionCount = 0;
+      let blockedCount = 0;
+      
+      // Mock signal generator for testing (in production, this would come from streaming)
+      const generateMockSignals = () => {
+        const mockTokens = [
+          'TokenA1111111111111111111111111111111111111',
+          'TokenB2222222222222222222222222222222222222',
+          'TokenC3333333333333333333333333333333333333'
+        ];
+        
+        const signalTypes = ['launch_momentum', 'micro_breakout'];
+        
+        setInterval(() => {
+          const signal = {
+            tokenMint: mockTokens[Math.floor(Math.random() * mockTokens.length)],
+            timestamp: Date.now(),
+            signalType: signalTypes[Math.floor(Math.random() * signalTypes.length)],
+            strength: 0.3 + Math.random() * 0.7, // 0.3-1.0
+            data: {
+              txPerMin: 5 + Math.random() * 50,
+              tvl: 1000 + Math.random() * 50000,
+              priceChange: (Math.random() - 0.5) * 20, // -10% to +10%
+              spread: 20 + Math.random() * 180, // 20-200 bps
+              depth: 500 + Math.random() * 10000,
+              volume24h: 10000 + Math.random() * 100000,
+              price: 0.001 + Math.random() * 0.1
+            }
+          };
+          
+          // Apply signal filters
+          if (signal.data.tvl < signalFilters.minTvl ||
+              signal.data.txPerMin < signalFilters.minTxPerMin ||
+              signal.data.spread > signalFilters.maxSpread ||
+              signal.data.depth < signalFilters.minDepth) {
+            return; // Skip filtered signals
+          }
+          
+          signalCount++;
+          console.log(`📊 Signal ${signalCount}: ${signal.signalType} for ${signal.tokenMint.slice(0, 8)}...`);
+          console.log(`   TVL: $${signal.data.tvl.toLocaleString()}, Activity: ${signal.data.txPerMin.toFixed(1)} tx/min`);
+          
+          // Process signal through strategies
+          const decisions = strategyManager.processSignal(signal);
+          
+          if (decisions.length > 0) {
+            decisionCount += decisions.length;
+            
+            // Execute decisions in shadow mode
+            decisions.forEach(async (decision) => {
+              try {
+                await strategyManager.executeDecision(decision);
+              } catch (error) {
+                console.error('Shadow execution error:', error.message);
+              }
+            });
+          }
+          
+        }, 5000 + Math.random() * 10000); // 5-15 second intervals
+      };
+      
+      // Start mock signal generation
+      generateMockSignals();
+      
+      // Periodic status reporting
+      const statusInterval = setInterval(() => {
+        const dailyStats = strategyManager.getDailyStats();
+        const metrics = strategyManager.getAggregatedMetrics();
+        
+        console.log('📈 Shadow Mode Status:');
+        console.log(`   Signals processed: ${signalCount}`);
+        console.log(`   Decisions generated: ${decisionCount}`);
+        console.log(`   Decisions blocked: ${blockedCount}`);
+        console.log(`   Open positions: ${dailyStats.openPositions}`);
+        console.log(`   Total notional: $${dailyStats.totalNotional.toLocaleString()}`);
+        console.log(`   Total trades: ${dailyStats.totalTrades}`);
+        
+        // Strategy-specific stats
+        Object.entries(metrics).forEach(([name, metric]) => {
+          console.log(`   ${name}: ${metric.trades.total} trades, ${(metric.trades.winRate * 100).toFixed(1)}% win rate`);
+        });
+        
+      }, 60000); // Every minute
+      
+      // Duration handling
+      const durationMs = {{ inputs.duration }} === 'PT30M' ? 1800000 : 600000; // 30 min or 10 min
+      console.log(`⏱️ Running shadow mode for ${durationMs / 1000} seconds...`);
+      
+      await new Promise(resolve => setTimeout(resolve, durationMs));
+      
+      clearInterval(statusInterval);
+      
+      // Final report
+      const finalStats = strategyManager.getDailyStats();
+      const finalMetrics = strategyManager.getAggregatedMetrics();
+      
+      console.log('📋 Final Shadow Mode Report:');
+      console.log('============================');
+      console.log(`Session ID: {{ vars.sessionId }}`);
+      console.log(`Duration: ${durationMs / 1000}s`);
+      console.log(`Signals processed: ${signalCount}`);
+      console.log(`Decisions generated: ${decisionCount}`);
+      console.log(`Shadow trades: ${finalStats.totalTrades}`);
+      console.log(`Total notional: $${finalStats.totalNotional.toLocaleString()}`);
+      console.log(`Estimated PnL: $${finalStats.totalPnl.toFixed(2)}`);
+      
+      console.log('\nStrategy Performance:');
+      Object.entries(finalMetrics).forEach(([name, metric]) => {
+        console.log(`${name}:`);
+        console.log(`  Trades: ${metric.trades.total}`);
+        console.log(`  Win Rate: ${(metric.trades.winRate * 100).toFixed(1)}%`);
+        console.log(`  Avg PnL: $${metric.performance.avgPnl.toFixed(2)}`);
+        console.log(`  Avg Latency: ${metric.execution.avgLatencyMs.toFixed(0)}ms`);
+      });
+      
+      // Save report
+      const report = {
+        sessionId: '{{ vars.sessionId }}',
+        duration: durationMs,
+        signals: signalCount,
+        decisions: decisionCount,
+        stats: finalStats,
+        metrics: finalMetrics,
+        timestamp: new Date().toISOString()
+      };
+      
+      process.env.SHADOW_REPORT = JSON.stringify(report);
+
+  - id: analyze-shadow-results
+    type: io.kestra.plugin.scripts.node.Script
+    description: "Analyze shadow mode results and generate insights"
+    nodeVersion: "{{ vars.nodeVersion }}"
+    workingDirectory: "{{ vars.projectRoot }}"
+    dependsOn: [start-signal-monitoring]
+    script: |
+      const shadowReport = JSON.parse(process.env.SHADOW_REPORT || '{}');
+      
+      console.log('📊 Analyzing shadow mode results...');
+      
+      const analysis = {
+        sessionId: '{{ vars.sessionId }}',
+        timestamp: new Date().toISOString(),
+        config: {
+          duration: '{{ inputs.duration }}',
+          strategies: {{ inputs.strategies }},
+          riskLimits: {{ inputs.riskLimits }}
+        },
+        performance: {
+          signalToDecisionRatio: shadowReport.decisions / Math.max(shadowReport.signals, 1),
+          avgTradesPerHour: (shadowReport.stats?.totalTrades || 0) / (shadowReport.duration / 3600000),
+          estimatedDailyVolume: (shadowReport.stats?.totalNotional || 0) * (86400000 / shadowReport.duration),
+          riskUtilization: {
+            notional: (shadowReport.stats?.totalNotional || 0) / {{ inputs.riskLimits.maxDailyNotional }},
+            trades: (shadowReport.stats?.totalTrades || 0) / {{ inputs.riskLimits.maxDailyTrades }}
+          }
+        },
+        insights: [],
+        recommendations: []
+      };
+      
+      // Generate insights
+      if (analysis.performance.signalToDecisionRatio > 0.3) {
+        analysis.insights.push('High signal-to-decision ratio - strategies are active');
+      } else if (analysis.performance.signalToDecisionRatio < 0.1) {
+        analysis.insights.push('Low signal-to-decision ratio - consider relaxing filters');
+      }
+      
+      if (analysis.performance.avgTradesPerHour > 10) {
+        analysis.insights.push('High trading frequency detected');
+        analysis.recommendations.push('Consider increasing position sizes or reducing frequency');
+      }
+      
+      if (analysis.performance.riskUtilization.notional > 0.8) {
+        analysis.recommendations.push('High notional utilization - consider increasing daily limits');
+      }
+      
+      if (analysis.performance.riskUtilization.trades > 0.8) {
+        analysis.recommendations.push('High trade count utilization - consider increasing trade limits');
+      }
+      
+      // Strategy-specific analysis
+      Object.entries(shadowReport.metrics || {}).forEach(([strategy, metrics]) => {
+        if (metrics.trades.winRate > 0.6) {
+          analysis.insights.push(`${strategy} shows promising win rate: ${(metrics.trades.winRate * 100).toFixed(1)}%`);
+        }
+        
+        if (metrics.execution.avgLatencyMs > 2000) {
+          analysis.recommendations.push(`${strategy} has high latency - optimize execution`);
+        }
+      });
+      
+      console.log('📋 Shadow Mode Analysis:');
+      console.log(JSON.stringify(analysis, null, 2));
+      
+      // Save analysis
+      const fs = require('fs');
+      const analysisPath = `/tmp/shadow-analysis-${analysis.sessionId}.json`;
+      fs.writeFileSync(analysisPath, JSON.stringify(analysis, null, 2));
+      console.log(`💾 Analysis saved to: ${analysisPath}`);
+
+triggers:
+  - id: webhook-shadow-mode
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: "Webhook triggered shadow mode testing"
+    key: "shadow-mode-webhook"
+
+  - id: scheduled-shadow-testing
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: "Scheduled shadow mode testing"
+    cron: "0 0 */6 * * ?" # Every 6 hours
+    disabled: true
+    inputs:
+      duration: "PT60M"
+      strategies: ["launch_momentum", "micro_breakout"]
+
+labels:
+  environment: "testing"
+  project: "solana-strategies"
+  version: "1.0.0"
+  type: "shadow-mode"

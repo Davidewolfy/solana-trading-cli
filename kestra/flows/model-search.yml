@@ -1,0 +1,526 @@
+id: model-search
+namespace: solana.ml
+
+description: |
+  ASI-Arch Model Search Flow
+  Autonomous architecture search for trading models with walk-forward validation
+
+inputs:
+  - id: symbol
+    type: STRING
+    required: true
+    defaults: "SOL-PERP"
+    description: "Trading symbol to train on"
+    
+  - id: lookback_days
+    type: INT
+    required: false
+    defaults: 30
+    description: "Days of historical data to use"
+    
+  - id: search_budget_hours
+    type: FLOAT
+    required: false
+    defaults: 2.0
+    description: "Maximum hours for architecture search"
+    
+  - id: architectures
+    type: ARRAY
+    required: false
+    defaults: ["linear_attention", "s4_like", "transformer_small", "lstm_baseline"]
+    description: "Architecture types to search"
+    
+  - id: target_sharpe
+    type: FLOAT
+    required: false
+    defaults: 1.5
+    description: "Target Sharpe ratio for early stopping"
+
+variables:
+  projectRoot: "/app/solana-trading-cli"
+  nodeVersion: "22.2.0"
+  pythonVersion: "3.11"
+  dataPath: "/app/data"
+  modelPath: "/app/models"
+  searchId: "search_{{ random() }}"
+
+tasks:
+  - id: validate-search-config
+    type: io.kestra.plugin.scripts.node.Script
+    description: "Validate model search configuration"
+    nodeVersion: "{{ vars.nodeVersion }}"
+    workingDirectory: "{{ vars.projectRoot }}"
+    timeout: "PT30S"
+    script: |
+      console.log('🔍 Validating model search configuration...');
+      
+      const config = {
+        symbol: '{{ inputs.symbol }}',
+        lookback_days: {{ inputs.lookback_days }},
+        search_budget_hours: {{ inputs.search_budget_hours }},
+        architectures: {{ inputs.architectures }},
+        target_sharpe: {{ inputs.target_sharpe }}
+      };
+      
+      console.log('Search config:', JSON.stringify(config, null, 2));
+      
+      // Validate inputs
+      if (config.lookback_days < 7) {
+        throw new Error('lookback_days must be at least 7');
+      }
+      
+      if (config.search_budget_hours < 0.1) {
+        throw new Error('search_budget_hours must be at least 0.1');
+      }
+      
+      if (config.target_sharpe < 0.5) {
+        throw new Error('target_sharpe must be at least 0.5');
+      }
+      
+      console.log('✅ Model search configuration validated');
+
+  - id: prepare-feature-data
+    type: io.kestra.plugin.scripts.node.Script
+    description: "Prepare feature data for model training"
+    nodeVersion: "{{ vars.nodeVersion }}"
+    workingDirectory: "{{ vars.projectRoot }}"
+    dependsOn: [validate-search-config]
+    timeout: "PT10M"
+    script: |
+      const { createFeatureStore } = require('./dist/ml/feature-store');
+      
+      console.log('📊 Preparing feature data...');
+      
+      const symbol = '{{ inputs.symbol }}';
+      const lookbackDays = {{ inputs.lookback_days }};
+      const endTime = Date.now();
+      const startTime = endTime - (lookbackDays * 24 * 60 * 60 * 1000);
+      
+      console.log(`Preparing data for ${symbol} from ${new Date(startTime)} to ${new Date(endTime)}`);
+      
+      const featureStore = createFeatureStore('{{ vars.dataPath }}');
+      
+      try {
+        // Generate features
+        const features = await featureStore.generateFeatures(symbol, startTime, endTime);
+        console.log(`Generated ${features.length} feature vectors`);
+        
+        if (features.length < 1000) {
+          console.warn('⚠️ Limited feature data - results may be unreliable');
+        }
+        
+        // Add labels
+        const labeledFeatures = await featureStore.addLabels(features, 15); // 15min lookahead
+        const validLabels = labeledFeatures.filter(f => f.return_15m !== undefined);
+        
+        console.log(`Added labels to ${validLabels.length} features`);
+        
+        if (validLabels.length < 500) {
+          throw new Error('Insufficient labeled data for training');
+        }
+        
+        // Split data for walk-forward validation
+        const trainSize = Math.floor(validLabels.length * 0.6);
+        const valSize = Math.floor(validLabels.length * 0.2);
+        
+        const trainData = validLabels.slice(0, trainSize);
+        const valData = validLabels.slice(trainSize, trainSize + valSize);
+        const testData = validLabels.slice(trainSize + valSize);
+        
+        console.log(`Data split: ${trainData.length} train, ${valData.length} val, ${testData.length} test`);
+        
+        // Store prepared data
+        const fs = require('fs');
+        const dataDir = '{{ vars.dataPath }}/prepared';
+        await fs.promises.mkdir(dataDir, { recursive: true });
+        
+        await fs.promises.writeFile(
+          `${dataDir}/train_{{ vars.searchId }}.json`,
+          JSON.stringify(trainData)
+        );
+        
+        await fs.promises.writeFile(
+          `${dataDir}/val_{{ vars.searchId }}.json`,
+          JSON.stringify(valData)
+        );
+        
+        await fs.promises.writeFile(
+          `${dataDir}/test_{{ vars.searchId }}.json`,
+          JSON.stringify(testData)
+        );
+        
+        console.log('✅ Feature data prepared and saved');
+        
+        // Store metadata for next tasks
+        global.dataMetadata = {
+          searchId: '{{ vars.searchId }}',
+          symbol,
+          trainSize: trainData.length,
+          valSize: valData.length,
+          testSize: testData.length,
+          featureCount: Object.keys(trainData[0]).length - 4 // Exclude timestamp, symbol, return, label
+        };
+        
+      } catch (error) {
+        console.error('❌ Feature preparation failed:', error.message);
+        throw error;
+      }
+
+  - id: architecture-search
+    type: io.kestra.plugin.scripts.python.Script
+    description: "Run architecture search with multiple models"
+    pythonVersion: "{{ vars.pythonVersion }}"
+    workingDirectory: "{{ vars.projectRoot }}"
+    dependsOn: [prepare-feature-data]
+    timeout: "PT{{ inputs.search_budget_hours | multiply(3600) }}S"
+    script: |
+      import json
+      import time
+      import numpy as np
+      import pandas as pd
+      from datetime import datetime
+      from typing import Dict, List, Tuple
+      import warnings
+      warnings.filterwarnings('ignore')
+      
+      print("🤖 Starting ASI-Arch model search...")
+      
+      # Load prepared data
+      search_id = "{{ vars.searchId }}"
+      data_dir = "{{ vars.dataPath }}/prepared"
+      
+      with open(f"{data_dir}/train_{search_id}.json", 'r') as f:
+          train_data = json.load(f)
+      
+      with open(f"{data_dir}/val_{search_id}.json", 'r') as f:
+          val_data = json.load(f)
+      
+      with open(f"{data_dir}/test_{search_id}.json", 'r') as f:
+          test_data = json.load(f)
+      
+      print(f"Loaded data: {len(train_data)} train, {len(val_data)} val, {len(test_data)} test")
+      
+      # Convert to DataFrames
+      train_df = pd.DataFrame(train_data)
+      val_df = pd.DataFrame(val_data)
+      test_df = pd.DataFrame(test_data)
+      
+      # Feature columns (exclude metadata)
+      feature_cols = [col for col in train_df.columns 
+                     if col not in ['timestamp', 'symbol', 'return_15m', 'label_direction', 'label_magnitude']]
+      
+      print(f"Feature columns: {feature_cols}")
+      
+      # Prepare features and targets
+      X_train = train_df[feature_cols].fillna(0).values
+      y_train = train_df['return_15m'].values
+      
+      X_val = val_df[feature_cols].fillna(0).values
+      y_val = val_df['return_15m'].values
+      
+      X_test = test_df[feature_cols].fillna(0).values
+      y_test = test_df['return_15m'].values
+      
+      print(f"Feature shape: {X_train.shape}")
+      
+      # Architecture search space
+      architectures = {{ inputs.architectures }}
+      search_budget_hours = {{ inputs.search_budget_hours }}
+      target_sharpe = {{ inputs.target_sharpe }}
+      
+      search_results = []
+      start_time = time.time()
+      
+      for arch_name in architectures:
+          if time.time() - start_time > search_budget_hours * 3600:
+              print(f"⏰ Search budget exhausted")
+              break
+              
+          print(f"\n🔧 Testing architecture: {arch_name}")
+          
+          try:
+              # Simple model implementations for POC
+              if arch_name == "linear_attention":
+                  from sklearn.linear_model import Ridge
+                  model = Ridge(alpha=0.1)
+                  
+              elif arch_name == "s4_like":
+                  from sklearn.ensemble import RandomForestRegressor
+                  model = RandomForestRegressor(n_estimators=50, max_depth=5, random_state=42)
+                  
+              elif arch_name == "transformer_small":
+                  from sklearn.ensemble import GradientBoostingRegressor
+                  model = GradientBoostingRegressor(n_estimators=100, max_depth=3, random_state=42)
+                  
+              elif arch_name == "lstm_baseline":
+                  from sklearn.linear_model import LinearRegression
+                  model = LinearRegression()
+                  
+              else:
+                  print(f"Unknown architecture: {arch_name}")
+                  continue
+              
+              # Train model
+              model.fit(X_train, y_train)
+              
+              # Validate
+              val_pred = model.predict(X_val)
+              
+              # Calculate trading metrics
+              val_returns = val_pred * np.sign(val_pred)  # Simple signal
+              val_returns = np.clip(val_returns, -0.02, 0.02)  # Clip extreme predictions
+              
+              # Add transaction costs
+              turnover = np.mean(np.abs(np.diff(np.sign(val_pred))))
+              transaction_cost = turnover * 0.0005  # 5 bps per turn
+              
+              net_returns = val_returns - transaction_cost
+              
+              # Calculate Sharpe ratio
+              if np.std(net_returns) > 0:
+                  sharpe = np.mean(net_returns) / np.std(net_returns) * np.sqrt(365 * 24 * 4)  # Annualized
+              else:
+                  sharpe = 0
+              
+              # Calculate other metrics
+              max_dd = 0
+              cumulative = np.cumprod(1 + net_returns)
+              peak = np.maximum.accumulate(cumulative)
+              drawdown = (cumulative - peak) / peak
+              max_dd = np.min(drawdown)
+              
+              calmar = sharpe / abs(max_dd) if max_dd != 0 else 0
+              
+              # Test set evaluation
+              test_pred = model.predict(X_test)
+              test_returns = test_pred * np.sign(test_pred)
+              test_returns = np.clip(test_returns, -0.02, 0.02)
+              test_turnover = np.mean(np.abs(np.diff(np.sign(test_pred))))
+              test_net_returns = test_returns - (test_turnover * 0.0005)
+              
+              test_sharpe = 0
+              if np.std(test_net_returns) > 0:
+                  test_sharpe = np.mean(test_net_returns) / np.std(test_net_returns) * np.sqrt(365 * 24 * 4)
+              
+              result = {
+                  'architecture': arch_name,
+                  'val_sharpe': float(sharpe),
+                  'val_calmar': float(calmar),
+                  'val_max_dd': float(max_dd),
+                  'val_turnover': float(turnover),
+                  'test_sharpe': float(test_sharpe),
+                  'feature_count': len(feature_cols),
+                  'train_time': time.time() - start_time,
+                  'timestamp': datetime.now().isoformat()
+              }
+              
+              search_results.append(result)
+              
+              print(f"  Val Sharpe: {sharpe:.3f}")
+              print(f"  Val Calmar: {calmar:.3f}")
+              print(f"  Val Max DD: {max_dd:.3f}")
+              print(f"  Test Sharpe: {test_sharpe:.3f}")
+              print(f"  Turnover: {turnover:.3f}")
+              
+              # Early stopping if target reached
+              if sharpe >= target_sharpe:
+                  print(f"🎯 Target Sharpe {target_sharpe} reached!")
+                  break
+                  
+          except Exception as e:
+              print(f"❌ Error with {arch_name}: {str(e)}")
+              continue
+      
+      # Sort results by validation Sharpe
+      search_results.sort(key=lambda x: x['val_sharpe'], reverse=True)
+      
+      print(f"\n📊 Search Results (top 3):")
+      for i, result in enumerate(search_results[:3]):
+          print(f"{i+1}. {result['architecture']}: Sharpe={result['val_sharpe']:.3f}, Calmar={result['val_calmar']:.3f}")
+      
+      # Save results
+      import os
+      os.makedirs("{{ vars.modelPath }}", exist_ok=True)
+      
+      with open(f"{{ vars.modelPath }}/search_results_{search_id}.json", 'w') as f:
+          json.dump(search_results, f, indent=2)
+      
+      print(f"✅ Architecture search completed in {(time.time() - start_time)/3600:.2f} hours")
+      print(f"📁 Results saved to search_results_{search_id}.json")
+
+  - id: select-best-model
+    type: io.kestra.plugin.scripts.node.Script
+    description: "Select best model and prepare for deployment"
+    nodeVersion: "{{ vars.nodeVersion }}"
+    workingDirectory: "{{ vars.projectRoot }}"
+    dependsOn: [architecture-search]
+    timeout: "PT60S"
+    script: |
+      const fs = require('fs');
+      
+      console.log('🏆 Selecting best model...');
+      
+      const searchId = '{{ vars.searchId }}';
+      const resultsPath = `{{ vars.modelPath }}/search_results_${searchId}.json`;
+      
+      if (!fs.existsSync(resultsPath)) {
+        throw new Error('Search results not found');
+      }
+      
+      const results = JSON.parse(fs.readFileSync(resultsPath, 'utf8'));
+      
+      if (results.length === 0) {
+        throw new Error('No successful model training runs');
+      }
+      
+      // Select best model by validation Sharpe
+      const bestModel = results[0];
+      
+      console.log('🥇 Best Model Selected:');
+      console.log(`   Architecture: ${bestModel.architecture}`);
+      console.log(`   Val Sharpe: ${bestModel.val_sharpe.toFixed(3)}`);
+      console.log(`   Test Sharpe: ${bestModel.test_sharpe.toFixed(3)}`);
+      console.log(`   Val Calmar: ${bestModel.val_calmar.toFixed(3)}`);
+      console.log(`   Max Drawdown: ${(bestModel.val_max_dd * 100).toFixed(2)}%`);
+      console.log(`   Turnover: ${(bestModel.val_turnover * 100).toFixed(2)}%`);
+      
+      // Validation checks
+      const warnings = [];
+      
+      if (bestModel.val_sharpe < 1.0) {
+        warnings.push('Low Sharpe ratio - consider more data or features');
+      }
+      
+      if (bestModel.val_turnover > 0.5) {
+        warnings.push('High turnover - may be overtrading');
+      }
+      
+      if (Math.abs(bestModel.val_sharpe - bestModel.test_sharpe) > 0.5) {
+        warnings.push('Large val/test Sharpe difference - possible overfitting');
+      }
+      
+      if (warnings.length > 0) {
+        console.log('\n⚠️ Warnings:');
+        warnings.forEach(warning => console.log(`   - ${warning}`));
+      }
+      
+      // Create deployment config
+      const deploymentConfig = {
+        searchId,
+        symbol: '{{ inputs.symbol }}',
+        selectedModel: bestModel,
+        deploymentReady: bestModel.val_sharpe > 0.8 && bestModel.val_turnover < 0.3,
+        warnings,
+        createdAt: new Date().toISOString()
+      };
+      
+      // Save deployment config
+      fs.writeFileSync(
+        `{{ vars.modelPath }}/deployment_config_${searchId}.json`,
+        JSON.stringify(deploymentConfig, null, 2)
+      );
+      
+      if (deploymentConfig.deploymentReady) {
+        console.log('✅ Model ready for deployment');
+      } else {
+        console.log('⚠️ Model needs improvement before deployment');
+      }
+      
+      console.log(`📁 Deployment config saved to deployment_config_${searchId}.json`);
+
+  - id: generate-model-report
+    type: io.kestra.plugin.scripts.node.Script
+    description: "Generate comprehensive model search report"
+    nodeVersion: "{{ vars.nodeVersion }}"
+    workingDirectory: "{{ vars.projectRoot }}"
+    dependsOn: [select-best-model]
+    script: |
+      const fs = require('fs');
+      
+      console.log('📋 Generating model search report...');
+      
+      const searchId = '{{ vars.searchId }}';
+      const results = JSON.parse(fs.readFileSync(`{{ vars.modelPath }}/search_results_${searchId}.json`, 'utf8'));
+      const deploymentConfig = JSON.parse(fs.readFileSync(`{{ vars.modelPath }}/deployment_config_${searchId}.json`, 'utf8'));
+      
+      const report = {
+        searchId,
+        symbol: '{{ inputs.symbol }}',
+        searchConfig: {
+          lookback_days: {{ inputs.lookback_days }},
+          search_budget_hours: {{ inputs.search_budget_hours }},
+          architectures: {{ inputs.architectures }},
+          target_sharpe: {{ inputs.target_sharpe }}
+        },
+        results: {
+          totalModels: results.length,
+          bestModel: deploymentConfig.selectedModel,
+          allResults: results
+        },
+        analysis: {
+          avgSharpe: results.reduce((sum, r) => sum + r.val_sharpe, 0) / results.length,
+          maxSharpe: Math.max(...results.map(r => r.val_sharpe)),
+          minSharpe: Math.min(...results.map(r => r.val_sharpe)),
+          avgTurnover: results.reduce((sum, r) => sum + r.val_turnover, 0) / results.length
+        },
+        recommendations: [],
+        createdAt: new Date().toISOString()
+      };
+      
+      // Generate recommendations
+      if (report.analysis.maxSharpe < 1.0) {
+        report.recommendations.push('Consider adding more features or increasing lookback period');
+      }
+      
+      if (report.analysis.avgTurnover > 0.3) {
+        report.recommendations.push('Models show high turnover - add turnover penalty to loss function');
+      }
+      
+      if (results.length < 3) {
+        report.recommendations.push('Search more architectures for better coverage');
+      }
+      
+      // Save report
+      fs.writeFileSync(
+        `{{ vars.modelPath }}/model_report_${searchId}.json`,
+        JSON.stringify(report, null, 2)
+      );
+      
+      console.log('📊 Model Search Report:');
+      console.log('======================');
+      console.log(`Search ID: ${searchId}`);
+      console.log(`Symbol: {{ inputs.symbol }}`);
+      console.log(`Models tested: ${results.length}`);
+      console.log(`Best Sharpe: ${report.analysis.maxSharpe.toFixed(3)}`);
+      console.log(`Avg Sharpe: ${report.analysis.avgSharpe.toFixed(3)}`);
+      console.log(`Avg Turnover: ${(report.analysis.avgTurnover * 100).toFixed(1)}%`);
+      console.log(`Deployment ready: ${deploymentConfig.deploymentReady ? 'Yes' : 'No'}`);
+      
+      if (report.recommendations.length > 0) {
+        console.log('\nRecommendations:');
+        report.recommendations.forEach(rec => console.log(`  - ${rec}`));
+      }
+      
+      console.log(`\n📁 Full report saved to model_report_${searchId}.json`);
+
+triggers:
+  - id: webhook-model-search
+    type: io.kestra.plugin.core.trigger.Webhook
+    description: "Webhook triggered model search"
+    key: "model-search-webhook"
+
+  - id: scheduled-model-search
+    type: io.kestra.plugin.core.trigger.Schedule
+    description: "Scheduled model retraining"
+    cron: "0 2 * * 1" # Every Monday at 2 AM
+    disabled: true
+    inputs:
+      symbol: "SOL-PERP"
+      lookback_days: 60
+      search_budget_hours: 4.0
+
+labels:
+  environment: "ml"
+  project: "solana-asi-arch"
+  version: "1.0.0"
+  type: "model-search"

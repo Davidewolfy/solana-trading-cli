@@ -1,0 +1,100 @@
+version: "3.8"
+
+services:
+  kestra:
+    image: kestra/kestra:latest
+    container_name: kestra-solana-trading
+    ports:
+      - "8080:8080"
+    environment:
+      KESTRA_CONFIGURATION: |
+        datasources:
+          postgres:
+            url: jdbc:postgresql://postgres:5432/kestra
+            driverClassName: org.postgresql.Driver
+            username: kestra
+            password: kestra
+        kestra:
+          server:
+            basic-auth:
+              enabled: false
+          repository:
+            type: postgres
+          storage:
+            type: local
+            local:
+              base-path: "/app/storage"
+          queue:
+            type: postgres
+          tasks:
+            tmp-dir:
+              path: /tmp/kestra-wd/tmp
+          url: http://localhost:8080/
+    volumes:
+      - kestra-data:/app/storage
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /tmp/kestra-wd:/tmp/kestra-wd
+      - ./flows:/app/flows
+      - ../:/app/solana-trading-cli:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - kestra-network
+
+  postgres:
+    image: postgres:14
+    container_name: kestra-postgres
+    environment:
+      POSTGRES_DB: kestra
+      POSTGRES_USER: kestra
+      POSTGRES_PASSWORD: kestra
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kestra"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - kestra-network
+
+  # Optional: Redis for caching and pub/sub
+  redis:
+    image: redis:7-alpine
+    container_name: kestra-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - kestra-network
+
+  # Optional: Elasticsearch for logs and metrics
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.8.0
+    container_name: kestra-elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data
+    networks:
+      - kestra-network
+
+volumes:
+  kestra-data:
+    driver: local
+  postgres-data:
+    driver: local
+  redis-data:
+    driver: local
+  elasticsearch-data:
+    driver: local
+
+networks:
+  kestra-network:
+    driver: bridge

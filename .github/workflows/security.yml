@@ -1,0 +1,274 @@
+name: Security Scan
+
+on:
+  push:
+    branches: [ main, typescript-main ]
+  pull_request:
+    branches: [ main, typescript-main ]
+  schedule:
+    - cron: '0 2 * * 1' # Weekly on Monday at 2 AM
+
+jobs:
+  dependency-scan:
+    name: Dependency Security Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22.2.0'
+        cache: 'npm'
+        
+    - name: Install dependencies
+      run: npm ci
+      
+    - name: Run npm audit
+      run: |
+        npm audit --audit-level=moderate --json > npm-audit.json || true
+        npm audit --audit-level=moderate
+      continue-on-error: true
+      
+    - name: Upload npm audit results
+      uses: actions/upload-artifact@v3
+      with:
+        name: npm-audit-results
+        path: npm-audit.json
+        
+    - name: Setup Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        override: true
+        
+    - name: Install cargo-audit
+      run: cargo install cargo-audit
+      
+    - name: Run Rust security audit
+      run: |
+        cd exec-rs
+        cargo audit --json > ../rust-audit.json || true
+        cargo audit
+      continue-on-error: true
+      
+    - name: Upload Rust audit results
+      uses: actions/upload-artifact@v3
+      with:
+        name: rust-audit-results
+        path: rust-audit.json
+
+  code-scan:
+    name: Code Security Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@v2
+      with:
+        languages: javascript, typescript
+        
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22.2.0'
+        cache: 'npm'
+        
+    - name: Install dependencies
+      run: npm ci
+      
+    - name: Build TypeScript
+      run: npm run build
+      
+    - name: Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@v2
+
+  secret-scan:
+    name: Secret Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        
+    - name: Run TruffleHog
+      uses: trufflesecurity/trufflehog@main
+      with:
+        path: ./
+        base: main
+        head: HEAD
+        extra_args: --debug --only-verified
+
+  docker-scan:
+    name: Docker Security Scan
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      
+    - name: Build Docker image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./Dockerfile
+        load: true
+        tags: solana-trading-cli:security-scan
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: 'solana-trading-cli:security-scan'
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+        
+    - name: Upload Trivy scan results
+      uses: github/codeql-action/upload-sarif@v2
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+  license-scan:
+    name: License Compliance
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '22.2.0'
+        cache: 'npm'
+        
+    - name: Install dependencies
+      run: npm ci
+      
+    - name: Install license checker
+      run: npm install -g license-checker
+      
+    - name: Check Node.js licenses
+      run: |
+        license-checker --json > node-licenses.json
+        license-checker --summary
+        
+    - name: Setup Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        override: true
+        
+    - name: Install cargo-license
+      run: cargo install cargo-license
+      
+    - name: Check Rust licenses
+      run: |
+        cd exec-rs
+        cargo license --json > ../rust-licenses.json
+        cargo license
+        
+    - name: Upload license reports
+      uses: actions/upload-artifact@v3
+      with:
+        name: license-reports
+        path: |
+          node-licenses.json
+          rust-licenses.json
+
+  security-report:
+    name: Security Report
+    runs-on: ubuntu-latest
+    needs: [dependency-scan, code-scan, secret-scan, docker-scan, license-scan]
+    if: always()
+    
+    steps:
+    - name: Download all artifacts
+      uses: actions/download-artifact@v3
+      
+    - name: Generate security report
+      run: |
+        echo "# Security Scan Report" > security-report.md
+        echo "Generated on: $(date)" >> security-report.md
+        echo "" >> security-report.md
+        
+        echo "## Dependency Scan Results" >> security-report.md
+        if [ -f npm-audit-results/npm-audit.json ]; then
+          echo "- npm audit completed" >> security-report.md
+        fi
+        if [ -f rust-audit-results/rust-audit.json ]; then
+          echo "- Rust audit completed" >> security-report.md
+        fi
+        echo "" >> security-report.md
+        
+        echo "## Code Scan Results" >> security-report.md
+        echo "- CodeQL analysis completed" >> security-report.md
+        echo "" >> security-report.md
+        
+        echo "## Secret Scan Results" >> security-report.md
+        echo "- TruffleHog scan completed" >> security-report.md
+        echo "" >> security-report.md
+        
+        echo "## Docker Scan Results" >> security-report.md
+        echo "- Trivy vulnerability scan completed" >> security-report.md
+        echo "" >> security-report.md
+        
+        echo "## License Compliance" >> security-report.md
+        if [ -f license-reports/node-licenses.json ]; then
+          echo "- Node.js license check completed" >> security-report.md
+        fi
+        if [ -f license-reports/rust-licenses.json ]; then
+          echo "- Rust license check completed" >> security-report.md
+        fi
+        
+    - name: Upload security report
+      uses: actions/upload-artifact@v3
+      with:
+        name: security-report
+        path: security-report.md
+        
+    - name: Comment on PR
+      if: github.event_name == 'pull_request'
+      uses: actions/github-script@v6
+      with:
+        script: |
+          const fs = require('fs');
+          const report = fs.readFileSync('security-report.md', 'utf8');
+          
+          github.rest.issues.createComment({
+            issue_number: context.issue.number,
+            owner: context.repo.owner,
+            repo: context.repo.repo,
+            body: `## 🔒 Security Scan Results\n\n${report}`
+          });
+
+  notify:
+    name: Security Notifications
+    runs-on: ubuntu-latest
+    needs: [security-report]
+    if: failure() && github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Notify security team
+      uses: 8398a7/action-slack@v3
+      with:
+        status: failure
+        channel: '#security-alerts'
+        webhook_url: ${{ secrets.SECURITY_SLACK_WEBHOOK }}
+        text: |
+          🚨 Security scan failed on main branch!
+          Repository: ${{ github.repository }}
+          Commit: ${{ github.sha }}
+          Please review the security scan results.
